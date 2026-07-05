@@ -1603,6 +1603,7 @@ for _k, _v in {
     "symbol": "", "loaded": False, "analyses": {},
     "vr_picks": None, "vr_total": 0,
     "picks_results": None, "picks_total": 0, "picks_found": 0,
+    "daily_picks": None,
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -2188,19 +2189,32 @@ with tab_daily:
             unsafe_allow_html=True,
         )
     with btn_col:
-        if st.button("🔄 Refresh", key="daily_refresh", help="Force a fresh scan"):
-            get_daily_picks.clear()
-            st.rerun()
+        _gen = st.button("✨ Generate", key="daily_gen",
+                         help="Run today's global scan (~60s)", use_container_width=True)
     st.markdown("")
 
-    with st.spinner(
-        "Building today's picks… scanning 1,500+ global stocks + ETFs. "
-        "First load takes ~60 s — cached all day after that."
-    ):
-        _daily = get_daily_picks(10)
+    # Lazy scan — only runs on button click, never automatically at startup.
+    # (An automatic startup scan crashes resource-limited hosts like Streamlit Cloud.)
+    if _gen:
+        get_daily_picks.clear()
+        with st.spinner(
+            "Building today's picks… scanning global stocks + ETFs. "
+            "Takes ~60 s — cached for the day after that."
+        ):
+            st.session_state["daily_picks"] = get_daily_picks(10)
+        st.rerun()
 
-    daily_stocks = _daily.get("stocks", [])
-    daily_etfs   = _daily.get("etfs",   [])
+    _daily = st.session_state.get("daily_picks")
+
+    if _daily is None:
+        st.info(
+            "Click **✨ Generate** (top-right) to build today's Top 10 global stocks & ETFs. "
+            "The scan takes ~60 seconds and is then cached for the day."
+        )
+        daily_stocks, daily_etfs = [], []
+    else:
+        daily_stocks = _daily.get("stocks", [])
+        daily_etfs   = _daily.get("etfs",   [])
 
     # ── STOCKS SECTION ────────────────────────────────────────────────────────
     st.markdown(
