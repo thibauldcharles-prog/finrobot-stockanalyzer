@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local runtime artifacts — do NOT deploy these
+cloudflared.exe
+_tunnel.log
+_tunnel_out.log
+_stdout.log
+_stderr.log
+current_link.txt
+
+# OS
+Thumbs.db
+.DS_Store
