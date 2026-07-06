@@ -411,10 +411,10 @@ _GEO_INDUSTRY_ADJ = {
     "Oil & Gas E&P":                     4,  # energy security premium
     "Oil & Gas Midstream":               3,
     "Oil & Gas Refining & Marketing":    2,
-    "Steel":                             4,  # US tariff protection
-    "Aluminum":                          3,
-    "Copper":                            3,  # electrification + reshoring
-    "Gold":                              3,  # safe-haven demand
+    "Steel":                             3,  # US tariff protection
+    "Aluminum":                          2,
+    "Copper":                            2,  # electrification + reshoring
+    "Gold":                              1,  # safe-haven demand (kept small — avoids gold-heavy lists)
     "Biotechnology":                     2,  # healthcare security focus
     "Drug Manufacturers—General":        2,
     "Drug Manufacturers—Specialty & Generic": 2,
@@ -438,7 +438,7 @@ _GEO_INDUSTRY_ADJ = {
 _GEO_SECTOR_ADJ = {
     "Industrials": 3,          # reshoring, infrastructure spending
     "Energy": 2,               # energy security premium
-    "Basic Materials": 2,      # commodity demand from reshoring
+    "Basic Materials": 1,      # commodity demand from reshoring (trimmed to avoid mining-heavy lists)
     "Healthcare": 2,           # healthcare security, pandemic prep
     "Consumer Defensive": 1,   # stable regardless of geo
     "Consumer Cyclical": -2,   # tariff/import sensitivity
@@ -540,6 +540,31 @@ def _score_etf(info: dict) -> int:
             score += 10 if f > 0.03 else 7 if f > 0.015 else 4 if f > 0.005 else 0
         except: pass
     return min(score, 100)
+
+
+def _diversify_by_sector(results: list, top_n: int, score_key: str = "combined_score",
+                         max_per_sector=None) -> list:
+    """Select top_n results while capping how many come from any single sector, so the
+    shortlist spans different markets instead of piling into one (e.g. mining/gold).
+    If there aren't enough distinct sectors, remaining slots are back-filled with the
+    next-highest-scoring names."""
+    if not results:
+        return []
+    ranked = sorted(results, key=lambda x: x.get(score_key, 0), reverse=True)
+    if max_per_sector is None:
+        max_per_sector = max(2, top_n // 5)   # 10→2, 15→3, 20→4, 30→6 → forces variety
+    picked, leftovers, counts = [], [], {}
+    for r in ranked:
+        sec = r.get("sector") or "Unknown"
+        if counts.get(sec, 0) < max_per_sector:
+            picked.append(r)
+            counts[sec] = counts.get(sec, 0) + 1
+        else:
+            leftovers.append(r)
+    out = picked[:top_n]
+    if len(out) < top_n:                       # not enough sectors — backfill by score
+        out = out + leftovers[: top_n - len(out)]
+    return out
 
 
 def run_local_analysis(analysis_type, symbol, info, income, balance, cashflow):
@@ -1342,7 +1367,7 @@ def _bulk_price_download(symbols_key: str, symbols: tuple) -> dict:
 
 def run_screener(max_price, min_score: int, top_n: int,
                  region: str, sector_filter: str,
-                 progress_bar=None, status_text=None) -> tuple:
+                 progress_bar=None, status_text=None, diversify: bool = True) -> tuple:
     universe = get_ticker_universe(region)
     total    = len(universe)
     results  = []
@@ -1418,11 +1443,12 @@ def run_screener(max_price, min_score: int, top_n: int,
                 results.append(r)
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_n], total, len(results)
+    top = _diversify_by_sector(results, top_n, "score") if diversify else results[:top_n]
+    return top, total, len(results)
 
 
 def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United States",
-                    progress_bar=None, status_text=None) -> tuple:
+                    progress_bar=None, status_text=None, diversify: bool = True) -> tuple:
     """Scan stocks and rank by quality + value-at-price + geopolitical score."""
     universe = get_ticker_universe(region)
     total    = len(universe)
@@ -1517,7 +1543,8 @@ def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United Sta
                 results.append(r)
 
     results.sort(key=lambda x: x["combined_score"], reverse=True)
-    return results[:top_n], total
+    top = _diversify_by_sector(results, top_n, "combined_score") if diversify else results[:top_n]
+    return top, total
 
 
 def run_etf_screener(top_n: int = 10,
@@ -1963,13 +1990,19 @@ with tab_picks:
             "The price filter applies in that currency (e.g. ¥ for Japan, £p for UK)."
         )
 
+    sp_diversify = st.checkbox(
+        "🌐 Diversify across sectors (spread picks over different markets)",
+        value=True, key="sp_div",
+        help="Caps how many picks come from any single sector so the list isn't dominated by one industry.",
+    )
     run_screen = st.button("🔎  Scan Global Stocks", type="primary", use_container_width=True)
 
     if run_screen:
         _pb  = st.progress(0)
         _st  = st.empty()
         _picks, _total_scanned, _total_found = run_screener(
-            max_price, min_score, top_n, region_key, sector_filter, _pb, _st
+            max_price, min_score, top_n, region_key, sector_filter, _pb, _st,
+            diversify=sp_diversify,
         )
         _pb.empty()
         _st.empty()
@@ -2050,7 +2083,7 @@ with tab_vr:
     st.markdown("### 🎯 Value Radar — Best Stocks at Today's Price")
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
-        "Ranks 1,000+ US stocks by a <b>Combined Score</b> built from three dimensions:<br>"
+        "Ranks stocks (US or the region you pick) by a <b>Combined Score</b> built from three dimensions:<br>"
         "① <b>Quality</b> — margins, ROE, revenue growth, debt/equity &nbsp;·&nbsp; "
         "② <b>Value-at-Price</b> — FCF yield, earnings yield, analyst upside, balance sheet &nbsp;·&nbsp; "
         "③ <b>Geopolitical</b> — current macro/political tailwinds &amp; headwinds "
@@ -2061,7 +2094,7 @@ with tab_vr:
     )
     st.markdown("")
 
-    vr_c1, vr_c2, vr_c3 = st.columns(3)
+    vr_c1, vr_c2, vr_c3, vr_c4 = st.columns(4)
     with vr_c1:
         vr_top_n = st.selectbox("Results to show", [10, 15, 20, 30], index=1,
                                 format_func=lambda x: f"Top {x}", key="vr_topn")
@@ -2069,15 +2102,22 @@ with tab_vr:
         vr_min = st.selectbox("Min combined score", [0, 30, 40, 50, 60], index=0,
                               format_func=lambda x: f"Score ≥ {x}", key="vr_min")
     with vr_c3:
+        vr_region_label = st.selectbox("Region / Market", _REGIONS, index=0, key="vr_region")
+        vr_region = _REGION_LABEL_MAP[vr_region_label]
+    with vr_c4:
         st.markdown("")
         st.markdown("")
         vr_run = st.button("🎯  Run Value Radar", type="primary",
                            use_container_width=True, key="vr_run")
 
+    vr_diversify = st.checkbox(
+        "🌐 Diversify across sectors (spread picks over different markets, not just the top-scoring niche)",
+        value=True, key="vr_div",
+    )
     st.markdown(
         "<span style='color:#484f58;font-size:0.78rem;'>"
-        "ℹ️  Scans the US universe (~1,000 stocks). "
-        "No price filter — all price ranges are included so you see the genuine best value."
+        "ℹ️  No price filter — all price ranges are included so you see the genuine best value. "
+        "With diversify on, no single sector can dominate the shortlist."
         "</span>",
         unsafe_allow_html=True,
     )
@@ -2086,7 +2126,8 @@ with tab_vr:
     if vr_run:
         _vr_pb = st.progress(0)
         _vr_st = st.empty()
-        _picks, _total = run_value_radar(vr_top_n, vr_min, "United States", _vr_pb, _vr_st)
+        _picks, _total = run_value_radar(vr_top_n, vr_min, vr_region, _vr_pb, _vr_st,
+                                         diversify=vr_diversify)
         _vr_pb.empty()
         _vr_st.empty()
         st.session_state["vr_picks"] = _picks
@@ -2109,10 +2150,18 @@ with tab_vr:
             "Wait 10–15 minutes and try again. Per-stock results are cached for 2 hours once fetched."
         )
     else:
+        _sectors = {}
+        for _p in _vr_picks:
+            _s = _p.get("sector") or "Unknown"
+            _sectors[_s] = _sectors.get(_s, 0) + 1
+        _sector_summary = " · ".join(f"{k} ({v})" for k, v in
+                                     sorted(_sectors.items(), key=lambda kv: -kv[1]))
         st.success(
             f"Scanned **{_vr_total:,}** stocks  ·  "
-            f"Showing top **{len(_vr_picks)}** by Combined Score"
+            f"Showing top **{len(_vr_picks)}** by Combined Score  ·  "
+            f"**{len(_sectors)} sectors** represented"
         )
+        st.caption(f"📊 Sector mix: {_sector_summary}")
         st.markdown("")
 
         for rank, p in enumerate(_vr_picks, 1):
