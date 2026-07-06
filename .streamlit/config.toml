@@ -8,7 +8,8 @@ font = "sans serif"
 
 [server]
 headless = true
-port = 8502
+# No hardcoded port: Streamlit Cloud manages the port (8501) and health-checks it.
+# Local launchers pass --server.port 8502 on the command line, which overrides this.
 
 [browser]
 gatherUsageStats = false

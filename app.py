@@ -213,7 +213,11 @@ def format_financial_df(df):
             if abs(n) >= 1e6:  return f"${n/1e6:.2f}M"
             return f"${n:,.0f}"
         except: return str(v)
-    return out.applymap(_fmt)
+    # pandas 3.0 removed DataFrame.applymap (use .map); older pandas only has applymap.
+    try:
+        return out.map(_fmt)
+    except AttributeError:
+        return out.applymap(_fmt)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
