@@ -567,6 +567,286 @@ def _diversify_by_sector(results: list, top_n: int, score_key: str = "combined_s
     return out
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ACADEMIC INVESTING THEORIES — 10 notable frameworks that reason about each pick
+# ══════════════════════════════════════════════════════════════════════════════
+# Each factor reads whatever fundamentals Yahoo provides and returns a 0-100 score,
+# a bullish/neutral/bearish signal and a one-line rationale. The composite blends
+# only the factors that HAVE data (weight-normalised), so missing fields never
+# unfairly penalise a stock. This makes the pick reasoning transparent and grounded
+# in published finance research instead of an opaque points total.
+
+_THEORY_META = [
+    # key,          display name,                        author(s),            weight
+    ("emh",        "Efficient Market Hypothesis",        "Eugene Fama",         0.8),
+    ("famafrench", "Fama–French Five-Factor Model",      "Fama & French",       1.3),
+    ("shiller",    "Behavioral Finance & CAPE",          "Robert Shiller",      1.1),
+    ("graham",     "Value & Margin of Safety",           "Graham & Buffett",    1.2),
+    ("piotroski",  "Quality F-Score",                    "Joseph Piotroski",    1.1),
+    ("lynch",      "Growth at a Reasonable Price (PEG)",  "Peter Lynch",         1.0),
+    ("momentum",   "Momentum",                           "Jegadeesh & Titman",  0.9),
+    ("mpt",        "Modern Portfolio Theory",            "Harry Markowitz",     0.7),
+    ("capm",       "CAPM / Sharpe Ratio",                "William Sharpe",      0.7),
+    ("ddm",        "Dividend Discount Model",            "Gordon & Williams",   0.8),
+]
+
+_THEORY_DESC = {
+    "emh":        "Markets largely price in known info, so trust the analyst consensus and be sceptical of 'free lunches' that look too large.",
+    "famafrench": "Long-run outperformance is explained by value (low P/B), size (small-cap), profitability and conservative investment factors.",
+    "shiller":    "Prices swing on sentiment and mean-revert; stretched multiples near highs signal exuberance, depressed profitable names signal opportunity.",
+    "graham":     "Buy below intrinsic value (Graham number) with a margin of safety, positive earnings and a solid balance sheet.",
+    "piotroski":  "A 9-point checklist of profitability, leverage and efficiency signals separates financially strong firms from weak ones.",
+    "lynch":      "Growth is only worth paying for relative to price — a PEG (P/E ÷ growth) under ~1 is attractive.",
+    "momentum":   "Recent winners tend to keep winning over 3–12 months; price above its moving averages confirms trend.",
+    "mpt":        "Judge a stock by its risk contribution to a diversified portfolio — lower beta and steadier quality are worth more per unit of risk.",
+    "capm":       "Expected return should compensate for systematic risk (beta); reward-per-unit-of-risk (a Sharpe-style ratio) should be high.",
+    "ddm":        "For income, value equals sustainable dividends discounted for growth — healthy yield with a safe payout ratio.",
+}
+
+
+def _ff(info, *keys):
+    """Safe float getter across candidate keys — returns None if absent/NaN."""
+    for k in keys:
+        v = info.get(k)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not pd.isna(fv):
+            return fv
+    return None
+
+
+def _sig(score):
+    return "🟢 bullish" if score >= 62 else "🔴 bearish" if score <= 42 else "🟡 neutral"
+
+
+def _th_emh(info):
+    price  = _ff(info, "currentPrice", "regularMarketPrice")
+    target = _ff(info, "targetMeanPrice")
+    n      = _ff(info, "numberOfAnalystOpinions")
+    if not price or not target:
+        return None
+    up = (target - price) / price * 100
+    if abs(up) < 5:      s, why = 58, f"price ≈ consensus fair value ({up:+.0f}%) — efficiently priced"
+    elif up > 35:        s, why = 44, f"{up:+.0f}% 'upside' looks too large — likely hidden risk priced in"
+    elif up > 8:         s, why = 70, f"consensus sees {up:+.0f}% upside" + (f" ({int(n)} analysts)" if n else "")
+    elif up > 0:         s, why = 60, f"modest consensus upside {up:+.0f}%"
+    else:                s, why = 40, f"consensus sees downside {up:+.0f}%"
+    if n and n >= 8:     s = min(100, s + 4)
+    return s, why
+
+
+def _th_famafrench(info):
+    subs, notes = [], []
+    pb = _ff(info, "priceToBook")
+    if pb is not None and pb > 0:
+        subs.append(90 if pb < 1 else 78 if pb < 1.5 else 62 if pb < 3 else 45 if pb < 6 else 30)
+        notes.append(f"P/B {pb:.1f}")
+    mc = _ff(info, "marketCap")
+    if mc:
+        subs.append(55 if mc > 200e9 else 62 if mc > 50e9 else 72 if mc > 10e9 else 80 if mc > 2e9 else 68)
+        notes.append("small/mid-cap" if mc < 10e9 else "large-cap")
+    roe = _ff(info, "returnOnEquity"); gm = _ff(info, "grossMargins"); prof = None
+    if roe is not None:
+        prof = 85 if roe > 0.2 else 68 if roe > 0.1 else 45 if roe > 0 else 25
+    if gm is not None:
+        g = 80 if gm > 0.5 else 65 if gm > 0.3 else 48 if gm > 0.15 else 32
+        prof = g if prof is None else (prof + g) / 2
+    if prof is not None:
+        subs.append(prof); notes.append("high profitability" if prof >= 68 else "profitability")
+    ocf = _ff(info, "operatingCashflow"); fcf = _ff(info, "freeCashflow")
+    if ocf and ocf > 0 and fcf is not None:
+        capex_ratio = max(0.0, (ocf - fcf) / ocf)
+        subs.append(82 if capex_ratio < 0.15 else 65 if capex_ratio < 0.4 else 45 if capex_ratio < 0.7 else 30)
+        notes.append("asset-light" if capex_ratio < 0.4 else "capital-intensive")
+    if not subs:
+        return None
+    return sum(subs) / len(subs), "; ".join(notes[:3])
+
+
+def _th_shiller(info):
+    price = _ff(info, "currentPrice", "regularMarketPrice")
+    hi = _ff(info, "fiftyTwoWeekHigh"); lo = _ff(info, "fiftyTwoWeekLow")
+    pe = _ff(info, "forwardPE", "trailingPE")
+    if not price or hi is None or lo is None or hi <= lo:
+        return None
+    pos = (price - lo) / (hi - lo)
+    profitable = pe is not None and pe > 0
+    if pos > 0.9 and pe and pe > 30:   return 30, f"near 52-wk high at {pe:.0f}× P/E — exuberance / reversion risk"
+    if pos > 0.85 and pe and pe > 45:  return 34, "top of range on a rich multiple — stretched"
+    if pos < 0.35 and profitable:      return 74, f"low in 52-wk range ({pos*100:.0f}%) yet profitable — contrarian value"
+    if pos < 0.5:                      return 60, f"below mid 52-wk range ({pos*100:.0f}%) — reversion upside"
+    return 48, f"mid/upper 52-wk range ({pos*100:.0f}%)"
+
+
+def _th_graham(info):
+    eps  = _ff(info, "trailingEps")
+    bvps = _ff(info, "bookValue")
+    price = _ff(info, "currentPrice", "regularMarketPrice")
+    if eps is None or price is None:
+        return None
+    if eps <= 0:
+        return 28, "negative EPS — fails Graham's earnings test"
+    if bvps and bvps > 0:
+        graham = (22.5 * eps * bvps) ** 0.5
+        margin = (graham - price) / price * 100
+        de = _ff(info, "debtToEquity"); cr = _ff(info, "currentRatio")
+        bonus = (3 if de is not None and de < 100 else 0) + (3 if cr is not None and cr > 1.5 else 0)
+        if margin > 25:  return min(100, 88 + bonus), f"{margin:+.0f}% vs Graham value — strong margin of safety"
+        if margin > 0:   return min(100, 70 + bonus), f"{margin:+.0f}% vs Graham value — some margin of safety"
+        if margin > -25: return 48, f"{margin:+.0f}% vs Graham value — near fair"
+        return 34, f"{margin:+.0f}% vs Graham value — above intrinsic"
+    pe = _ff(info, "trailingPE", "forwardPE")
+    if pe and pe > 0:
+        return (72 if pe < 15 else 52 if pe < 25 else 36), f"P/E {pe:.0f} vs Graham's 15× ceiling"
+    return None
+
+
+def _th_piotroski(info):
+    checks = passed = 0
+    def _chk(cond):
+        nonlocal checks, passed
+        checks += 1
+        if cond: passed += 1
+    pm  = _ff(info, "profitMargins")
+    roa = _ff(info, "returnOnAssets")
+    ocf = _ff(info, "operatingCashflow")
+    ni  = _ff(info, "netIncomeToCommon")
+    de  = _ff(info, "debtToEquity")
+    cr  = _ff(info, "currentRatio")
+    gm  = _ff(info, "grossMargins")
+    if pm  is not None: _chk(pm > 0)
+    if roa is not None: _chk(roa > 0)
+    if ocf is not None:
+        _chk(ocf > 0)
+        if ni is not None: _chk(ocf > ni)        # low accruals = quality earnings
+    if de is not None: _chk(de < 100)
+    if cr is not None: _chk(cr > 1)
+    if gm is not None: _chk(gm > 0.2)
+    if checks < 3:
+        return None
+    return passed / checks * 100, f"passes {passed}/{checks} financial-health checks"
+
+
+def _th_lynch(info):
+    peg = _ff(info, "trailingPegRatio", "pegRatio")
+    if peg is None:
+        pe = _ff(info, "forwardPE", "trailingPE")
+        g  = _ff(info, "earningsGrowth", "revenueGrowth")
+        if pe and pe > 0 and g and g > 0:
+            peg = pe / (g * 100)
+    if peg is None:
+        return None
+    if peg <= 0:   return 30, "no/negative growth vs price — PEG unfavourable"
+    if peg < 1:    return 86, f"PEG {peg:.2f} — growth cheap vs price"
+    if peg < 1.5:  return 70, f"PEG {peg:.2f} — reasonable growth price"
+    if peg < 2:    return 55, f"PEG {peg:.2f} — fairly priced growth"
+    if peg < 3:    return 40, f"PEG {peg:.2f} — paying up for growth"
+    return 28, f"PEG {peg:.2f} — expensive vs growth"
+
+
+def _th_momentum(info):
+    price = _ff(info, "currentPrice", "regularMarketPrice")
+    ma200 = _ff(info, "twoHundredDayAverage")
+    ma50  = _ff(info, "fiftyDayAverage")
+    hi = _ff(info, "fiftyTwoWeekHigh"); lo = _ff(info, "fiftyTwoWeekLow")
+    if not price:
+        return None
+    subs, notes = [], []
+    if ma200:
+        r = price / ma200
+        subs.append(80 if r > 1.1 else 65 if r > 1 else 45 if r > 0.9 else 32)
+        notes.append(f"{(r-1)*100:+.0f}% vs 200-day")
+    if ma50 and ma200:
+        subs.append(70 if ma50 > ma200 else 40)          # golden/death-cross proxy
+    if hi is not None and lo is not None and hi > lo:
+        subs.append(35 + (price - lo) / (hi - lo) * 45)
+    if not subs:
+        return None
+    return sum(subs) / len(subs), "; ".join(notes) or "trend gauge"
+
+
+def _th_mpt(info):
+    beta = _ff(info, "beta")
+    pm   = _ff(info, "profitMargins")
+    if beta is None:
+        return None
+    bscore = 78 if beta < 0.8 else 66 if beta < 1.1 else 50 if beta < 1.4 else 36 if beta < 1.8 else 26
+    if pm is not None:
+        q = 70 if pm > 0.1 else 50 if pm > 0 else 32
+        bscore = (bscore * 2 + q) / 3
+    tag = "low" if beta < 0.9 else "high" if beta > 1.4 else "moderate"
+    return bscore, f"β {beta:.2f} — {tag} portfolio risk"
+
+
+def _th_capm(info):
+    beta   = _ff(info, "beta")
+    price  = _ff(info, "currentPrice", "regularMarketPrice")
+    target = _ff(info, "targetMeanPrice")
+    if beta is None or beta <= 0 or not price or not target:
+        return None
+    up = (target - price) / price * 100
+    rr = up / beta
+    if rr > 20:  return 85, f"{up:+.0f}% upside at β {beta:.2f} — strong reward-per-risk"
+    if rr > 8:   return 70, f"{up:+.0f}% upside at β {beta:.2f} — good reward-per-risk"
+    if rr > 0:   return 55, f"{up:+.0f}% upside at β {beta:.2f} — modest reward-per-risk"
+    return 38, f"{up:+.0f}% at β {beta:.2f} — weak reward-per-risk"
+
+
+def _th_ddm(info):
+    dy     = _ff(info, "dividendYield", "trailingAnnualDividendYield")
+    payout = _ff(info, "payoutRatio")
+    g      = _ff(info, "earningsGrowth", "revenueGrowth")
+    if not dy:
+        return 50, "no dividend — DDM N/A (suits growth, not income, mandates)"
+    y = dy if dy < 1 else dy / 100        # yfinance mixes fraction vs percent
+    score = 80 if y > 0.04 else 70 if y > 0.025 else 58 if y > 0.01 else 45
+    note  = f"yield {y*100:.1f}%"
+    if payout is not None:
+        if 0 < payout < 0.7:  score = min(100, score + 8); note += f", payout {payout*100:.0f}% (sustainable)"
+        elif payout >= 1:     score = max(20, score - 20); note += f", payout {payout*100:.0f}% (unsustainable)"
+    if g is not None and g > 0.05:
+        score = min(100, score + 5); note += ", growing"
+    return score, note
+
+
+_THEORY_FNS = {
+    "emh": _th_emh, "famafrench": _th_famafrench, "shiller": _th_shiller,
+    "graham": _th_graham, "piotroski": _th_piotroski, "lynch": _th_lynch,
+    "momentum": _th_momentum, "mpt": _th_mpt, "capm": _th_capm, "ddm": _th_ddm,
+}
+
+
+def _theory_factors(info: dict) -> list:
+    """Run all 10 theories over a stock; return list of dicts (only those with data)."""
+    out = []
+    for key, name, author, weight in _THEORY_META:
+        try:
+            res = _THEORY_FNS[key](info)
+        except Exception:
+            res = None
+        if not res:
+            continue
+        score = max(0, min(100, round(res[0])))
+        out.append({"key": key, "name": name, "author": author, "weight": weight,
+                    "score": score, "signal": _sig(score), "note": res[1]})
+    return out
+
+
+def _theory_composite(facs: list) -> int:
+    if not facs:
+        return 0
+    wsum = sum(f["weight"] for f in facs)
+    return round(sum(f["score"] * f["weight"] for f in facs) / wsum) if wsum else 0
+
+
+def _theory_score(info: dict) -> int:
+    return _theory_composite(_theory_factors(info))
+
+
 def run_local_analysis(analysis_type, symbol, info, income, balance, cashflow):
     sector = info.get("sector","")
     name   = info.get("longName") or info.get("shortName") or symbol
@@ -577,9 +857,56 @@ def run_local_analysis(analysis_type, symbol, info, income, balance, cashflow):
         "cash_flow":     lambda: _la_cashflow(symbol, name, info, cashflow),
         "risk":          lambda: _la_risk(symbol, name, sector, info),
         "thesis":        lambda: _la_thesis(symbol, name, sector, info),
+        "theories":      lambda: _la_theories(symbol, name, info),
     }
     fn = fns.get(analysis_type)
     return fn() if fn else "Unknown analysis type."
+
+
+def _la_theories(symbol, name, info):
+    """Scorecard of the 10 notable investing theories applied to this stock."""
+    facs = _theory_factors(info)
+    if not facs:
+        return "Not enough fundamental data to evaluate the investing theories for this stock."
+    composite = _theory_composite(facs)
+    verdict = ("🟢 **Theories broadly favour this stock**" if composite >= 62 else
+               "🔴 **Theories broadly caution against this stock**" if composite <= 42 else
+               "🟡 **Theories are mixed on this stock**")
+    lines = [
+        f"## 📚 Investing-Theory Scorecard — {name}",
+        "",
+        f"**Composite theory score: {composite}/100** &nbsp; — {verdict}",
+        "",
+        "Blends the academic frameworks below, weighted by reliability and using only "
+        "the factors with available data. Each is a published, widely-cited approach to "
+        "deciding whether a stock is worth owning.",
+        "",
+        "| Theory | Author(s) | Signal | Score | What it sees |",
+        "|---|---|:--:|:--:|---|",
+    ]
+    for f in sorted(facs, key=lambda x: -x["score"]):
+        lines.append(
+            f"| {f['name']} | {f['author']} | {f['signal']} | {f['score']}/100 | {f['note']} |"
+        )
+    # Bull/caution summary from the strongest agreements & disagreements
+    bulls = [f for f in facs if f["score"] >= 62]
+    bears = [f for f in facs if f["score"] <= 42]
+    lines += ["", "### Where the theories agree"]
+    if bulls:
+        lines += [f"- ✅ **{f['name']}** ({f['author']}): {f['note']}" for f in
+                  sorted(bulls, key=lambda x: -x["score"])[:4]]
+    else:
+        lines.append("- No framework is strongly bullish here.")
+    lines += ["", "### Points of caution"]
+    if bears:
+        lines += [f"- ⚠️ **{f['name']}** ({f['author']}): {f['note']}" for f in
+                  sorted(bears, key=lambda x: x["score"])[:4]]
+    else:
+        lines.append("- No framework is strongly bearish here.")
+    lines += ["", "---", "*Educational tooling, not investment advice. Frameworks can and do "
+              "disagree — that tension (e.g. Momentum vs Shiller's mean-reversion) is normal "
+              "and is exactly why diversification matters.*"]
+    return "\n".join(lines)
 
 
 def _la_overview(symbol, name, sector, info):
@@ -1468,9 +1795,12 @@ def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United Sta
 
         quality  = _score_stock(info)
         value    = _value_at_price_score(info)
+        theory_facs = _theory_factors(info)
+        theory   = _theory_composite(theory_facs)
         geo_adj, geo_label, geo_reason = _geo_adjustment(info)
-        # Combined = average of quality & value, then nudged by geo
-        combined = max(0, min(100, round((quality + value) / 2) + geo_adj))
+        # Combined = weighted blend of quality, value-at-price and the academic
+        # theory composite (Fama, Shiller, Graham, …), then nudged by geopolitics.
+        combined = max(0, min(100, round(0.30 * quality + 0.28 * value + 0.42 * theory) + geo_adj))
         if combined < min_combined:
             return None
 
@@ -1501,6 +1831,8 @@ def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United Sta
             "combined_score": combined,
             "quality_score":  quality,
             "value_score":    value,
+            "theory_score":   theory,
+            "theory_factors": theory_facs,
             "geo_adj":        geo_adj,
             "geo_label":      geo_label,
             "geo_reason":     geo_reason,
@@ -1869,6 +2201,7 @@ ANALYSIS_TYPES = {
     "cash_flow":     ("💸 Cash Flow",         "OCF quality, FCF, capital allocation"),
     "risk":          ("⚠️ Risk Assessment",   "Market, business, financial & ESG risks"),
     "thesis":        ("🎯 Investment Thesis", "Bull/Bear/Base cases with price targets"),
+    "theories":      ("📚 Investing Theories", "Fama, Shiller, Graham, Lynch & 6 more applied"),
 }
 
 with tab_ai:
@@ -2083,15 +2416,30 @@ with tab_vr:
     st.markdown("### 🎯 Value Radar — Best Stocks at Today's Price")
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
-        "Ranks stocks (US or the region you pick) by a <b>Combined Score</b> built from three dimensions:<br>"
+        "Ranks stocks (US or the region you pick) by a <b>Combined Score</b> built from four dimensions:<br>"
         "① <b>Quality</b> — margins, ROE, revenue growth, debt/equity &nbsp;·&nbsp; "
         "② <b>Value-at-Price</b> — FCF yield, earnings yield, analyst upside, balance sheet &nbsp;·&nbsp; "
-        "③ <b>Geopolitical</b> — current macro/political tailwinds &amp; headwinds "
-        "(NATO defense spending, CHIPS Act reshoring, US-China tensions, tariff exposure, "
-        "energy independence drive, sanctions risk)."
+        "③ <b>📚 Academic Theories</b> — 10 published frameworks (Fama, Shiller, Graham, Lynch…) &nbsp;·&nbsp; "
+        "④ <b>Geopolitical</b> — macro/political tailwinds &amp; headwinds."
         "</span>",
         unsafe_allow_html=True,
     )
+    with st.expander("📚 The 10 investing theories behind every score"):
+        st.markdown(
+            "Each pick is reasoned through these published, widely-cited frameworks. "
+            "Only the factors with available data are used, and they're blended by reliability "
+            "weight. Expand any pick's **“Why?”** to see how it scores on each.\n"
+        )
+        _tbl = "\n".join(
+            f"| {name} | {author} | {_THEORY_DESC.get(key,'')} |"
+            for key, name, author, _w in _THEORY_META
+        )
+        st.markdown(
+            "| Theory | Author(s) | What it says |\n|---|---|---|\n" + _tbl
+        )
+        st.caption("Educational tooling, not investment advice. These frameworks often "
+                   "disagree (e.g. Momentum vs Shiller's mean-reversion) — that tension is "
+                   "expected and is why diversification matters.")
     st.markdown("")
 
     vr_c1, vr_c2, vr_c3, vr_c4 = st.columns(4)
@@ -2168,12 +2516,14 @@ with tab_vr:
             cs  = p["combined_score"]
             qs  = p["quality_score"]
             vs  = p["value_score"]
+            ts  = p.get("theory_score", 0)
             ga  = p["geo_adj"]
             try:
                 pe_s = f"{float(p['pe']):.1f}x" if p.get("pe") else "N/A"
             except (TypeError, ValueError):
                 pe_s = "N/A"
 
+            ts_color  = "#3fb950" if ts >= 62 else "#f85149" if ts <= 42 else "#d29922"
             cs_color  = "#3fb950" if cs >= 60 else "#d29922" if cs >= 45 else "#8b949e"
             geo_color = "#3fb950" if ga > 0 else "#f85149" if ga < 0 else "#8b949e"
             geo_sign  = f"+{ga}" if ga > 0 else str(ga)
@@ -2199,6 +2549,7 @@ with tab_vr:
                 f'<span style="font-size:0.95rem;font-weight:700;color:{cs_color};">Combined {cs}/100</span>'
                 f'<span style="color:#8b949e;font-size:0.8rem;">'
                 f' &nbsp;Q:{qs} &nbsp;V:{vs} &nbsp;'
+                f'<span style="color:{ts_color};font-weight:700;">📚 Theory:{ts}</span> &nbsp;'
                 f'<span style="color:{geo_color};">Geo:{geo_sign}</span>'
                 f'</span><br>'
                 f'<span style="font-size:0.8rem;color:{geo_color};">'
@@ -2216,6 +2567,18 @@ with tab_vr:
                 f'</div>'
             )
             st.markdown(html, unsafe_allow_html=True)
+
+            _facs = p.get("theory_factors") or []
+            if _facs:
+                with st.expander(f"📚 Why? — {len(_facs)} investing theories on {p['symbol']}"):
+                    _rows = "\n".join(
+                        f"| {f['name']} | {f['author']} | {f['signal']} | {f['score']}/100 | {f['note']} |"
+                        for f in sorted(_facs, key=lambda x: -x["score"])
+                    )
+                    st.markdown(
+                        "| Theory | Author(s) | Signal | Score | What it sees |\n"
+                        "|---|---|:--:|:--:|---|\n" + _rows
+                    )
             if st.button(f"📊 Deep-Dive {p['symbol']}", key=f"vr_{p['symbol']}_{rank}"):
                 st.session_state.symbol   = p["symbol"]
                 st.session_state.loaded   = False
