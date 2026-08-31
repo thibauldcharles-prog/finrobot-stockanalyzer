@@ -1879,60 +1879,112 @@ def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United Sta
     return top, total
 
 
+def _score_etf_returns(r3, r5, ytd, vol) -> int:
+    """Score an ETF 0-100 from computed returns + volatility (risk-adjusted)."""
+    score = 0
+    if r3 is not None:
+        score += 34 if r3 > 0.15 else 26 if r3 > 0.10 else 17 if r3 > 0.05 else 8 if r3 > 0 else 0
+    if r5 is not None:
+        score += 24 if r5 > 0.12 else 18 if r5 > 0.08 else 12 if r5 > 0.04 else 5 if r5 > 0 else 0
+    if ytd is not None:
+        score += 16 if ytd > 0.15 else 11 if ytd > 0.05 else 6 if ytd > 0 else 0
+    if r3 is not None and vol and vol > 0:
+        sharpe = r3 / vol                       # crude return-per-unit-of-risk
+        score += 26 if sharpe > 1.2 else 18 if sharpe > 0.8 else 10 if sharpe > 0.4 else 4 if sharpe > 0 else 0
+    return min(score, 100)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def run_etf_screener(top_n: int = 10,
                      progress_bar=None, status_text=None) -> list:
-    """Scan _ETF_UNIVERSE and rank by ETF score."""
-    total   = len(_ETF_UNIVERSE)
-    results = []
+    """Rank ETFs from ONE batch price download instead of hundreds of per-ETF .info
+    calls — this survives Yahoo's rate limits on shared IPs (e.g. Streamlit Cloud).
+    Returns are computed from 5 years of prices; only the winning top_n are enriched
+    with names / expense ratios via a handful of .info calls."""
+    syms = list(_ETF_UNIVERSE)
+    if status_text is not None:
+        status_text.text(f"Downloading 5y prices for {len(syms)} ETFs in one batch…")
+    if progress_bar is not None:
+        progress_bar.progress(0.15)
 
-    def _fetch(sym: str):
-        info = _get_info_cached(sym)
-        if not info:
-            return None
-        if info.get("quoteType", "").upper() not in ("ETF", "MUTUALFUND", ""):
-            return None
-        price = _g(info, "currentPrice", "regularMarketPrice", "navPrice")
-        if not price:
-            return None
+    try:
+        data = yf.download(syms, period="5y", interval="1d",
+                           progress=False, auto_adjust=True, threads=True)
+    except Exception:
+        data = None
+    if data is None or getattr(data, "empty", True):
+        return []
+
+    try:
+        close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+    except Exception:
+        close = data
+    if isinstance(close, pd.Series):
+        close = close.to_frame()
+
+    now_year = _date.today().year
+    scored = []
+    for sym in syms:
         try:
-            price = float(price)
-        except (ValueError, TypeError):
-            return None
+            s = close[sym].dropna() if sym in close.columns else None
+        except Exception:
+            s = None
+        if s is None or len(s) < 60:
+            continue
+        price = float(s.iloc[-1])
         if price <= 0:
-            return None
-        score = _score_etf(info)
-        er  = info.get("annualReportExpenseRatio") or info.get("netExpenseRatio")
-        yld = info.get("yield") or info.get("trailingAnnualDividendYield")
-        return {
-            "symbol":    sym,
-            "name":      info.get("shortName") or info.get("longName") or sym,
-            "price":     price,
-            "score":     score,
-            "category":  info.get("category") or info.get("fundFamily") or "ETF",
-            "er":        er,
-            "yield":     yld,
-            "r3y":       info.get("threeYearAverageReturn"),
-            "r5y":       info.get("fiveYearAverageReturn"),
-            "ytd":       info.get("ytdReturn"),
-            "aum":       info.get("totalAssets"),
-            "is_etf":    True,
-        }
+            continue
+        years = len(s) / 252.0
+        r5 = None
+        if years >= 1:
+            p0 = float(s.iloc[0])
+            if p0 > 0:
+                r5 = (price / p0) ** (1 / years) - 1
+        r3 = None
+        if len(s) > 756:
+            p3 = float(s.iloc[-756])
+            if p3 > 0:
+                r3 = (price / p3) ** (1 / 3) - 1
+        elif years >= 2:
+            r3 = r5                              # <3y history — use whole-period annualised
+        ytd = None
+        s_ytd = s[s.index.year == now_year]
+        if len(s_ytd) > 1:
+            p_ytd = float(s_ytd.iloc[0])
+            if p_ytd > 0:
+                ytd = price / p_ytd - 1
+        daily = s.pct_change().dropna()
+        vol = float(daily.std() * np.sqrt(252)) if len(daily) > 20 else None
+        scored.append({
+            "symbol": sym, "name": sym, "price": price,
+            "score": _score_etf_returns(r3, r5, ytd, vol),
+            "category": "ETF", "er": None, "yield": None,
+            "r3y": r3, "r5y": r5, "ytd": ytd, "aum": None, "is_etf": True,
+        })
 
-    completed = 0
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_fetch, sym): sym for sym in _ETF_UNIVERSE}
-        for future in as_completed(futures):
-            completed += 1
-            if progress_bar is not None:
-                progress_bar.progress(completed / total)
-            if status_text is not None:
-                status_text.text(f"Scanning ETFs… {completed}/{total}")
-            r = future.result()
-            if r is not None:
-                results.append(r)
+    # Rank by score, then by 3yr then 5yr return so that ETFs saturating at 100
+    # in a bull market are still ordered meaningfully (best risk/return first).
+    scored.sort(key=lambda x: (x["score"], x.get("r3y") or -9, x.get("r5y") or -9),
+                reverse=True)
+    top = scored[:top_n]
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_n]
+    # Enrich only the winners with name / expense ratio / yield (few .info calls).
+    if status_text is not None:
+        status_text.text("Fetching details for the top ETFs…")
+    for i, e in enumerate(top):
+        if progress_bar is not None:
+            progress_bar.progress(0.6 + 0.4 * (i + 1) / max(len(top), 1))
+        try:
+            info = _get_info_cached(e["symbol"]) or {}
+        except Exception:
+            info = {}
+        if info:
+            e["name"]     = info.get("shortName") or info.get("longName") or e["symbol"]
+            e["category"] = info.get("category") or info.get("fundFamily") or "ETF"
+            e["er"]       = info.get("annualReportExpenseRatio") or info.get("netExpenseRatio")
+            e["yield"]    = info.get("yield") or info.get("trailingAnnualDividendYield")
+            e["aum"]      = info.get("totalAssets")
+    return top
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
