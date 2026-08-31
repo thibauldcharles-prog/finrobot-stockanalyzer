@@ -2690,7 +2690,14 @@ with tab_daily:
         unsafe_allow_html=True,
     )
     if not daily_stocks:
-        st.warning("No stock picks available. Click 🔄 Refresh to try again.")
+        st.warning(
+            "**No stock picks returned** — stock scoring needs per-stock fundamentals "
+            "(margins, ROE, etc.), and Yahoo Finance **rate-limits those calls on shared "
+            "cloud IPs**. The ETF Top 10 below still works here because it uses a single "
+            "batch download. For live **stock** scans, run the app on your own IP: the "
+            "desktop app (localhost) or the **Shareable Link** desktop icon. Otherwise wait "
+            "10–15 min and press **✨ Generate** again."
+        )
     else:
         st.markdown(
             f"<span style='color:#484f58;font-size:0.78rem;'>"
@@ -2768,7 +2775,10 @@ with tab_daily:
         unsafe_allow_html=True,
     )
     if not daily_etfs:
-        st.warning("No ETF picks available. Click 🔄 Refresh to try again.")
+        st.warning(
+            "No ETF picks available — the batch price download returned nothing. "
+            "This is usually a brief network hiccup; press **✨ Generate** again in a moment."
+        )
     else:
         st.markdown(
             f"<span style='color:#484f58;font-size:0.78rem;'>"
