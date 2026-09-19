@@ -450,53 +450,260 @@ _GEO_SECTOR_ADJ = {
 }
 
 
-def _geo_adjustment(info: dict) -> tuple:
-    """Returns (adjustment int -15…+15, short label str, reason str)."""
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE MARKET CONTEXT — daily geopolitics · supply/demand · industry rotation
+# ══════════════════════════════════════════════════════════════════════════════
+# The static tables above encode slow-moving STRATEGIC facts (sanctions regimes,
+# trade blocs). They can't see what changed this week. This engine measures what
+# the market is ACTUALLY doing right now — which country, sector, industry and
+# commodity is being bid up or sold off — from one batch price download, and
+# blends that live signal with the strategic prior. Refreshes every 2 hours.
+
+_MARKET_PROBES = {
+    # Broad market / risk regime
+    "SPY":  "S&P 500",            "QQQ":  "Nasdaq 100",      "IWM":  "Small caps",
+    "EFA":  "Developed intl",     "EEM":  "Emerging markets", "^VIX": "Volatility (VIX)",
+    "TLT":  "Long Treasuries",    "UUP":  "US Dollar",
+    # Sectors (SPDR)
+    "XLK":  "Technology",         "XLE":  "Energy",          "XLF":  "Financials",
+    "XLV":  "Healthcare",         "XLI":  "Industrials",     "XLP":  "Cons. Defensive",
+    "XLY":  "Cons. Cyclical",     "XLU":  "Utilities",       "XLRE": "Real Estate",
+    "XLB":  "Basic Materials",    "XLC":  "Communications",
+    # Supply & demand — commodities / inputs
+    "USO":  "Crude oil",          "UNG":  "Natural gas",     "GLD":  "Gold",
+    "SLV":  "Silver",             "CPER": "Copper",          "DBA":  "Agriculture",
+    "URA":  "Uranium",            "LIT":  "Lithium/battery",
+    # Industry & theme rotation
+    "SMH":  "Semiconductors",     "ITA":  "Aerospace/Defense", "XBI": "Biotech",
+    "TAN":  "Solar",              "JETS": "Airlines",        "XRT":  "Retail",
+    "KRE":  "Regional banks",     "IYT":  "Transport",       "CIBR": "Cybersecurity",
+    "GDX":  "Gold miners",        "XHB":  "Homebuilders",
+    # Countries — live geopolitical sentiment
+    "EWJ":  "Japan",   "EWG": "Germany", "EWU": "United Kingdom", "EWQ": "France",
+    "FXI":  "China",   "INDA":"India",   "EWZ": "Brazil",         "EWY": "South Korea",
+    "EWT":  "Taiwan",  "EWC": "Canada",  "EWA": "Australia",      "EWW": "Mexico",
+    "EIS":  "Israel",  "EWL": "Switzerland",
+}
+
+# yfinance sector name → sector ETF
+_SECTOR_ETF = {
+    "Technology": "XLK", "Energy": "XLE", "Financial Services": "XLF",
+    "Healthcare": "XLV", "Industrials": "XLI", "Consumer Defensive": "XLP",
+    "Consumer Cyclical": "XLY", "Utilities": "XLU", "Real Estate": "XLRE",
+    "Basic Materials": "XLB", "Communication Services": "XLC",
+}
+
+# yfinance country → country ETF (live sentiment toward that market)
+_COUNTRY_ETF = {
+    "United States": "SPY", "Japan": "EWJ", "Germany": "EWG",
+    "United Kingdom": "EWU", "France": "EWQ", "China": "FXI", "Hong Kong": "FXI",
+    "India": "INDA", "Brazil": "EWZ", "South Korea": "EWY", "Taiwan": "EWT",
+    "Canada": "EWC", "Australia": "EWA", "Mexico": "EWW", "Israel": "EIS",
+    "Switzerland": "EWL", "Netherlands": "EFA", "Sweden": "EFA", "Denmark": "EFA",
+    "Norway": "EFA", "Finland": "EFA", "Spain": "EFA", "Italy": "EFA",
+    "Singapore": "EFA", "Ireland": "EFA", "Belgium": "EFA",
+}
+
+# industry keyword (substring, checked in order) → probe ETF
+_INDUSTRY_ETF = [
+    ("Semiconductor", "SMH"), ("Aerospace", "ITA"), ("Defense", "ITA"),
+    ("Biotechnology", "XBI"), ("Drug Manufacturers", "XBI"),
+    ("Solar", "TAN"), ("Renewable", "TAN"), ("Uranium", "URA"),
+    ("Airlines", "JETS"), ("Airport", "JETS"),
+    ("Oil & Gas", "USO"), ("Gold", "GDX"), ("Silver", "GDX"),
+    ("Copper", "CPER"), ("Aluminum", "CPER"), ("Steel", "XLB"),
+    ("Lithium", "LIT"), ("Banks", "KRE"), ("Trucking", "IYT"),
+    ("Railroad", "IYT"), ("Freight", "IYT"), ("Marine", "IYT"),
+    ("Security", "CIBR"), ("Residential Construction", "XHB"),
+    ("Building", "XHB"), ("Retail", "XRT"), ("Farm", "DBA"),
+    ("Agricultural", "DBA"), ("Utilities", "XLU"),
+]
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def get_market_context() -> dict:
+    """One batch download → live regime, sector/industry/country momentum and
+    supply-demand signals. Rate-limit friendly (a single request) so it works on
+    shared cloud IPs. Returns {} on failure, which makes callers fall back to the
+    static strategic tables."""
+    syms = list(_MARKET_PROBES.keys())
+    try:
+        data = yf.download(syms, period="6mo", interval="1d",
+                           progress=False, auto_adjust=True, threads=True)
+    except Exception:
+        return {}
+    if data is None or getattr(data, "empty", True):
+        return {}
+    try:
+        close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+    except Exception:
+        close = data
+    if isinstance(close, pd.Series):
+        close = close.to_frame()
+
+    sig = {}
+    for sym in syms:
+        try:
+            s = close[sym].dropna() if sym in close.columns else None
+        except Exception:
+            s = None
+        if s is None or len(s) < 30:
+            continue
+        last = float(s.iloc[-1])
+        if last <= 0:
+            continue
+        def _ret(days):
+            if len(s) <= days:
+                return None
+            p = float(s.iloc[-days - 1])
+            return (last / p - 1) if p > 0 else None
+        r1w, r1m, r3m = _ret(5), _ret(21), _ret(63)
+        ma50 = float(s.tail(50).mean()) if len(s) >= 50 else None
+        # Recency-weighted blend: this week matters most, quarter gives context.
+        parts = [(r1w, 0.30), (r1m, 0.45), (r3m, 0.25)]
+        avail = [(v, w) for v, w in parts if v is not None]
+        blended = sum(v * w for v, w in avail) / sum(w for _, w in avail) if avail else 0.0
+        sig[sym] = {
+            "label": _MARKET_PROBES[sym], "price": last,
+            "r1w": r1w, "r1m": r1m, "r3m": r3m, "blended": blended,
+            "above_ma50": (last > ma50) if ma50 else None,
+        }
+
+    if "SPY" not in sig:
+        return {}
+    base = sig["SPY"]["blended"]
+    for sym, d in sig.items():
+        d["rs"] = (d["blended"] - base) * 100.0      # relative strength vs SPY, in %
+
+    # ── Risk regime ────────────────────────────────────────────────────────────
+    vix   = sig.get("^VIX", {}).get("price")
+    spy_t = sig.get("SPY", {}).get("above_ma50")
+    risk  = 0
+    if vix is not None:
+        risk += 2 if vix < 15 else 1 if vix < 20 else -1 if vix < 28 else -2
+    if spy_t is not None:
+        risk += 1 if spy_t else -1
+    if sig.get("IWM", {}).get("rs", 0) > 1:
+        risk += 1                                    # small caps leading = risk appetite
+    if sig.get("GLD", {}).get("rs", 0) > 4 and sig.get("SPY", {}).get("blended", 0) < 0:
+        risk -= 1                                    # gold bid while stocks fall = fear
+    regime = ("Risk-on" if risk >= 2 else "Risk-off" if risk <= -2 else "Neutral")
+
+    # ── Geopolitical tension gauge (defense + gold bid, high vol) ──────────────
+    tension = 0.0
+    for k, w in (("ITA", 0.4), ("GLD", 0.35), ("USO", 0.25)):
+        tension += (sig.get(k, {}).get("rs", 0) or 0) * w
+    if vix is not None and vix > 25:
+        tension += 3
+    tension_lbl = ("Elevated" if tension > 4 else
+                   "Rising"   if tension > 1.5 else
+                   "Calm"     if tension < -1.5 else "Normal")
+
+    return {
+        "asof":    _date.today().isoformat(),
+        "signals": sig,
+        "regime":  regime,
+        "risk_score": risk,
+        "vix":     vix,
+        "tension": round(tension, 1),
+        "tension_label": tension_lbl,
+    }
+
+
+def _rs_adj(ctx: dict, sym: str, cap: float = 8.0) -> float:
+    """Convert a probe's relative strength vs SPY into a bounded score nudge."""
+    if not ctx or not sym:
+        return 0.0
+    rs = (ctx.get("signals", {}).get(sym, {}) or {}).get("rs")
+    if rs is None:
+        return 0.0
+    return max(-cap, min(cap, rs / 2.0))
+
+
+def _industry_probe(industry: str) -> str:
+    for kw, etf in _INDUSTRY_ETF:
+        if kw.lower() in (industry or "").lower():
+            return etf
+    return ""
+
+
+def _geo_adjustment(info: dict, ctx: dict = None) -> tuple:
+    """Blend the STRATEGIC prior (static tables) with LIVE market signals
+    (country / sector / industry momentum, commodity supply-demand, risk regime).
+    Returns (adjustment int -15…+15, label str, reason str)."""
     country  = info.get("country", "")
     industry = info.get("industry", "")
     sector   = info.get("sector", "")
 
-    adj  = _GEO_COUNTRY_ADJ.get(country, 0)
-    adj += _GEO_INDUSTRY_ADJ.get(
-        industry,
-        _GEO_SECTOR_ADJ.get(sector, 0)   # fall back to sector nudge
-    )
-    adj = max(-15, min(15, adj))
+    # ── Strategic prior — slow-moving facts momentum can't see ────────────────
+    static = _GEO_COUNTRY_ADJ.get(country, 0)
+    static += _GEO_INDUSTRY_ADJ.get(industry, _GEO_SECTOR_ADJ.get(sector, 0))
+    static = max(-15, min(15, static))
 
-    # Traffic-light label
-    if adj >= 10:    label = "🟢 Strong geo tailwind"
-    elif adj >= 5:   label = "🟢 Geo tailwind"
-    elif adj >= 1:   label = "🟡 Mild geo positive"
-    elif adj == 0:   label = "⚪ Geo neutral"
-    elif adj >= -4:  label = "🟡 Mild geo risk"
-    elif adj >= -8:  label = "🔴 Geo headwind"
-    else:            label = "🔴 High geo risk"
-
-    # Specific reason tag
-    if "Defense" in industry or "Aerospace" in industry:
-        reason = "NATO/defense spending↑"
-    elif "Semiconductor" in industry:
-        reason = "CHIPS Act reshoring"
-    elif "Solar" in industry or "Renewable" in industry or "Uranium" in industry:
-        reason = "energy independence drive"
-    elif "Oil" in industry or "Gas" in industry:
-        reason = "energy security premium"
-    elif "Steel" in industry or "Aluminum" in industry or "Copper" in industry:
-        reason = "tariff-protected materials"
-    elif country in ("China", "Hong Kong"):
-        reason = "US-China trade/regulatory risk"
-    elif country == "Russia":
-        reason = "sanctions & isolation risk"
-    elif "Auto" in industry:
-        reason = "auto tariff exposure"
-    elif "Apparel" in industry or "Consumer Electronics" in industry:
-        reason = "import tariff headwind"
-    elif "Luxury" in industry:
-        reason = "China consumer slowdown"
-    elif country == "India":
-        reason = "neutral geopolitics, strong growth"
+    if not ctx or not ctx.get("signals"):
+        adj, drivers = static, []          # no live data → strategic only
     else:
-        reason = country if country else "diversified exposure"
+        c_etf = _COUNTRY_ETF.get(country, "")
+        s_etf = _SECTOR_ETF.get(sector, "")
+        i_etf = _industry_probe(industry)
+
+        c_adj = _rs_adj(ctx, c_etf, 7)
+        s_adj = _rs_adj(ctx, s_etf, 7)
+        i_adj = _rs_adj(ctx, i_etf, 9)     # industry is the sharpest live signal
+
+        live = (c_adj * 0.30) + (s_adj * 0.30) + (i_adj * 0.40) if i_etf else \
+               (c_adj * 0.42) + (s_adj * 0.58)
+
+        # Risk regime tilts defensives vs cyclicals
+        regime = ctx.get("regime")
+        if regime == "Risk-off" and sector in ("Consumer Defensive", "Utilities", "Healthcare"):
+            live += 1.5
+        elif regime == "Risk-off" and sector in ("Consumer Cyclical", "Technology"):
+            live -= 1.5
+        elif regime == "Risk-on" and sector in ("Technology", "Consumer Cyclical", "Industrials"):
+            live += 1.5
+
+        # Blend: live conditions dominate (that's the point — today's market),
+        # but the strategic prior still anchors slow-moving structural facts.
+        # live is scaled to the same ±15 range as `static` before weighting.
+        adj = 0.35 * static + 0.65 * (live * 3.0)
+        adj = int(round(max(-15, min(15, adj))))
+
+        # Build a human reason from the strongest live drivers
+        drivers = []
+        for etf, a in ((i_etf, i_adj), (s_etf, s_adj), (c_etf, c_adj)):
+            if not etf or abs(a) < 1.2:
+                continue
+            d = ctx["signals"].get(etf, {})
+            nm, rs = d.get("label", etf), d.get("rs", 0)
+            drivers.append(f"{nm} {rs:+.0f}% vs mkt")
+        drivers = drivers[:2]
+
+    adj = int(round(max(-15, min(15, adj))))
+
+    if adj >= 10:    label = "🟢 Strong tailwind"
+    elif adj >= 5:   label = "🟢 Tailwind"
+    elif adj >= 1:   label = "🟡 Mild positive"
+    elif adj == 0:   label = "⚪ Neutral"
+    elif adj >= -4:  label = "🟡 Mild risk"
+    elif adj >= -8:  label = "🔴 Headwind"
+    else:            label = "🔴 High risk"
+
+    if drivers:
+        reason = " · ".join(drivers)
+        if ctx.get("regime") and ctx["regime"] != "Neutral":
+            reason += f" · {ctx['regime']}"
+    else:
+        # Fall back to the strategic narrative
+        if "Defense" in industry or "Aerospace" in industry:  reason = "defense spending↑"
+        elif "Semiconductor" in industry:                     reason = "chip reshoring"
+        elif "Solar" in industry or "Uranium" in industry:    reason = "energy independence"
+        elif "Oil" in industry or "Gas" in industry:          reason = "energy security"
+        elif country in ("China", "Hong Kong"):               reason = "US-China trade risk"
+        elif country == "Russia":                             reason = "sanctions risk"
+        elif "Auto" in industry:                              reason = "auto tariff exposure"
+        elif "Luxury" in industry:                            reason = "China consumer slowdown"
+        else: reason = country if country else "diversified exposure"
 
     return adj, label, reason
 
@@ -1776,10 +1983,19 @@ def run_screener(max_price, min_score: int, top_n: int,
 
 def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United States",
                     progress_bar=None, status_text=None, diversify: bool = True) -> tuple:
-    """Scan stocks and rank by quality + value-at-price + geopolitical score."""
+    """Scan stocks and rank by quality + value-at-price + theories, adjusted by the
+    LIVE market context (today's geopolitics, supply/demand and industry rotation)."""
     universe = get_ticker_universe(region)
     total    = len(universe)
     results  = []
+
+    # Live daily context — one cached batch call, shared by every stock scored below.
+    if status_text is not None:
+        status_text.text("Reading today's market context (geopolitics · supply/demand · rotation)…")
+    try:
+        _mkt_ctx = get_market_context()
+    except Exception:
+        _mkt_ctx = {}
 
     def _fetch(sym: str):
         info  = _get_info_cached(sym) or {}
@@ -1797,7 +2013,7 @@ def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United Sta
         value    = _value_at_price_score(info)
         theory_facs = _theory_factors(info)
         theory   = _theory_composite(theory_facs)
-        geo_adj, geo_label, geo_reason = _geo_adjustment(info)
+        geo_adj, geo_label, geo_reason = _geo_adjustment(info, _mkt_ctx)
         # Combined = weighted blend of quality, value-at-price and the academic
         # theory composite (Fama, Shiller, Graham, …), then nudged by geopolitics.
         combined = max(0, min(100, round(0.30 * quality + 0.28 * value + 0.42 * theory) + geo_adj))
@@ -2072,7 +2288,7 @@ price = prev = chg = chg_pct = chg_str  = None
 
 _header_slot = st.empty()   # company header injected here when a stock is loaded
 
-tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr, tab_daily = st.tabs([
+tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr, tab_daily, tab_pulse = st.tabs([
     "  📊 Overview  ",
     "  📈 Price Chart  ",
     "  🏦 Financials  ",
@@ -2080,6 +2296,7 @@ tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr, tab_daily = st.tabs([
     "  💡 Stock Picks  ",
     "  🎯 Value Radar  ",
     "  📅 Daily Top 10  ",
+    "  🌍 Market Pulse  ",
 ])
 
 if not sym:
@@ -2822,3 +3039,142 @@ with tab_daily:
                 st.session_state.analyses = {}
                 st.rerun()
             st.markdown("")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MARKET PULSE TAB — the live daily context feeding every score
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_pulse:
+    st.markdown("### 🌍 Market Pulse — today's conditions feeding every score")
+    st.markdown(
+        "<span style='color:#8b949e;font-size:0.85rem;'>"
+        "Live geopolitical, supply/demand and industry-rotation signals measured from "
+        "the market itself — not hardcoded assumptions. Every number is <b>relative "
+        "strength vs the S&amp;P 500</b> (recency-weighted: 1 week 30% · 1 month 45% · "
+        "3 months 25%). These feed the Geo adjustment in Value Radar, Stock Picks and "
+        "Daily Top 10. Refreshes every 2 hours."
+        "</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
+    _pc1, _pc2 = st.columns([1, 4])
+    with _pc1:
+        if st.button("🔄 Refresh now", key="pulse_refresh", use_container_width=True):
+            get_market_context.clear()
+            st.rerun()
+
+    with st.spinner("Reading live market conditions…"):
+        try:
+            _ctx = get_market_context()
+        except Exception as _e:
+            _ctx = {}
+
+    if not _ctx or not _ctx.get("signals"):
+        st.error(
+            "**Could not load live market data.** Yahoo may be rate-limiting this IP. "
+            "Scores fall back to the strategic (static) model until this recovers — "
+            "try **🔄 Refresh now** in a few minutes."
+        )
+    else:
+        _sig = _ctx["signals"]
+        _vix = _ctx.get("vix")
+        _reg = _ctx.get("regime", "Neutral")
+        _reg_color = {"Risk-on": "#3fb950", "Risk-off": "#f85149"}.get(_reg, "#d29922")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Risk regime", _reg)
+        m2.metric("VIX", f"{_vix:.1f}" if _vix else "N/A",
+                  help="Below 20 = calm, above 28 = stressed")
+        m3.metric("Geo tension", _ctx.get("tension_label", "—"),
+                  help="Defense + gold + oil bid, and volatility")
+        m4.metric("Signals live", f"{len(_sig)}/{len(_MARKET_PROBES)}")
+        st.caption(f"As of {_ctx.get('asof','')} · regime drives defensive vs cyclical tilt in every pick's score.")
+        st.markdown("")
+
+        def _strength_bar(rs):
+            """Dependency-free visual: ▰ blocks either side of centre."""
+            n = max(-5, min(5, int(round(rs / 2.5))))
+            if n > 0:  return "🟩" * n
+            if n < 0:  return "🟥" * (-n)
+            return "▫️"
+
+        def _pulse_table(title, syms, note=""):
+            rows = []
+            for s_ in syms:
+                d = _sig.get(s_)
+                if not d or d.get("rs") is None:
+                    continue
+                rows.append({
+                    "Signal": d["label"],
+                    "Strength": _strength_bar(d["rs"]),
+                    "vs S&P": round(d["rs"], 1),
+                    "1 week": round((d["r1w"] or 0) * 100, 1),
+                    "1 month": round((d["r1m"] or 0) * 100, 1),
+                    "3 month": round((d["r3m"] or 0) * 100, 1),
+                    "Trend": "📈" if d.get("above_ma50") else "📉",
+                })
+            if not rows:
+                return
+            df_ = pd.DataFrame(rows).sort_values("vs S&P", ascending=False)
+            st.markdown(f"<div class='section-header'>{title}</div>", unsafe_allow_html=True)
+            if note:
+                st.caption(note)
+            st.dataframe(
+                df_, use_container_width=True, hide_index=True,
+                column_config={
+                    "Strength": st.column_config.TextColumn("Strength", help="🟩 leading · 🟥 lagging"),
+                    "vs S&P":  st.column_config.NumberColumn("vs S&P", format="%+.1f%%",
+                                help="Relative strength vs the S&P 500 (recency-weighted)"),
+                    "1 week":  st.column_config.NumberColumn("1 week",  format="%+.1f%%"),
+                    "1 month": st.column_config.NumberColumn("1 month", format="%+.1f%%"),
+                    "3 month": st.column_config.NumberColumn("3 month", format="%+.1f%%"),
+                    "Trend":   st.column_config.TextColumn("Trend", help="vs 50-day average"),
+                },
+            )
+            st.markdown("")
+
+        _pulse_table(
+            "🏭 Industry & sector rotation",
+            ["XLK","XLE","XLF","XLV","XLI","XLP","XLY","XLU","XLRE","XLB","XLC",
+             "SMH","ITA","XBI","TAN","JETS","XRT","KRE","IYT","CIBR","GDX","XHB"],
+            "Which industries money is actually flowing into right now. A stock in a "
+            "leading industry gets a score boost; a laggard gets marked down.",
+        )
+        _pulse_table(
+            "⚖️ Supply & demand — commodities and inputs",
+            ["USO","UNG","GLD","SLV","CPER","DBA","URA","LIT","TLT","UUP"],
+            "Rising copper/oil signal industrial demand and input-cost pressure; gold "
+            "and Treasuries bid signal defensive positioning; a strong dollar pressures "
+            "exporters and emerging markets.",
+        )
+        _pulse_table(
+            "🌐 Geopolitics — live sentiment by country",
+            ["SPY","EWJ","EWG","EWU","EWQ","FXI","INDA","EWZ","EWY","EWT","EWC",
+             "EWA","EWW","EIS","EWL","EFA","EEM"],
+            "How capital is actually treating each market. This replaces guesswork "
+            "about political risk with what investors are doing with real money.",
+        )
+
+        _ranked = sorted((d for d in _sig.values() if d.get("rs") is not None),
+                         key=lambda d: -d["rs"])
+        lc, rc = st.columns(2)
+        with lc:
+            st.markdown("<div class='section-header'>🟢 Today's tailwinds</div>",
+                        unsafe_allow_html=True)
+            for d in _ranked[:6]:
+                st.markdown(f"- **{d['label']}** &nbsp;`{d['rs']:+.1f}%` vs market")
+        with rc:
+            st.markdown("<div class='section-header'>🔴 Today's headwinds</div>",
+                        unsafe_allow_html=True)
+            for d in _ranked[-6:][::-1]:
+                st.markdown(f"- **{d['label']}** &nbsp;`{d['rs']:+.1f}%` vs market")
+
+        st.markdown("")
+        st.caption(
+            "How this is used: each stock's Geo score = 35% strategic prior "
+            "(structural facts like sanctions or trade blocs) + 65% live signal from "
+            "its country, sector and industry above, tilted by the risk regime. "
+            "Educational tooling, not investment advice."
+        )
