@@ -610,6 +610,64 @@ def get_market_context() -> dict:
     }
 
 
+def _market_score(info: dict, ctx: dict = None) -> int:
+    """0-100: how well this stock fits TODAY'S market — its own relative strength
+    and trend, plus the live industry / sector / country flows and risk regime.
+    This is the fast-moving counterweight to the slow fundamental scores, so daily
+    market changes actually move the rankings."""
+    subs = []                                    # (score, weight)
+    price = _ff(info, "currentPrice", "regularMarketPrice")
+
+    # 1) The stock's OWN relative strength vs the S&P over the last year
+    ch   = _ff(info, "52WeekChange")
+    spch = _ff(info, "SandP52WeekChange")
+    if ch is not None and spch is not None:
+        rs = (ch - spch) * 100.0
+        subs.append((50 + max(-40, min(40, rs * 1.2)), 1.3))
+
+    # 2) Trend structure vs moving averages
+    ma50, ma200 = _ff(info, "fiftyDayAverage"), _ff(info, "twoHundredDayAverage")
+    if price and ma50 and ma200:
+        s = 50
+        s += 14 if price > ma50  else -14
+        s += 12 if price > ma200 else -12
+        s +=  8 if ma50  > ma200 else -8
+        subs.append((max(0, min(100, s)), 1.1))
+
+    # 3) Position in the 52-week range — strong, but fade blow-off tops
+    hi, lo = _ff(info, "fiftyTwoWeekHigh"), _ff(info, "fiftyTwoWeekLow")
+    if price and hi and lo and hi > lo:
+        pos = (price - lo) / (hi - lo)
+        s = 40 + pos * 55 if pos <= 0.85 else 88 - (pos - 0.85) * 80
+        subs.append((max(0, min(100, s)), 0.7))
+
+    # 4) Live flows into this stock's industry / sector / country
+    if ctx and ctx.get("signals"):
+        probes = (
+            (_industry_probe(info.get("industry", "")),        1.2),
+            (_SECTOR_ETF.get(info.get("sector", ""), ""),      1.0),
+            (_COUNTRY_ETF.get(info.get("country", ""), ""),    0.8),
+        )
+        for etf, w in probes:
+            d = ctx["signals"].get(etf) if etf else None
+            if not d or d.get("rs") is None:
+                continue
+            subs.append((50 + max(-42, min(42, d["rs"] * 3.0)), w))
+
+        # 5) Risk-regime fit
+        sec, reg = info.get("sector", ""), ctx.get("regime")
+        if reg == "Risk-off":
+            subs.append((68 if sec in ("Consumer Defensive", "Utilities", "Healthcare")
+                         else 38 if sec in ("Consumer Cyclical", "Technology") else 50, 0.6))
+        elif reg == "Risk-on":
+            subs.append((66 if sec in ("Technology", "Consumer Cyclical", "Industrials")
+                         else 46 if sec in ("Utilities", "Consumer Defensive") else 50, 0.6))
+
+    if not subs:
+        return 50                                # no data → neutral, never penalise
+    return int(round(sum(s * w for s, w in subs) / sum(w for _, w in subs)))
+
+
 def _rs_adj(ctx: dict, sym: str, cap: float = 8.0) -> float:
     """Convert a probe's relative strength vs SPY into a bounded score nudge."""
     if not ctx or not sym:
@@ -2013,10 +2071,15 @@ def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United Sta
         value    = _value_at_price_score(info)
         theory_facs = _theory_factors(info)
         theory   = _theory_composite(theory_facs)
+        market   = _market_score(info, _mkt_ctx)
         geo_adj, geo_label, geo_reason = _geo_adjustment(info, _mkt_ctx)
-        # Combined = weighted blend of quality, value-at-price and the academic
-        # theory composite (Fama, Shiller, Graham, …), then nudged by geopolitics.
-        combined = max(0, min(100, round(0.30 * quality + 0.28 * value + 0.42 * theory) + geo_adj))
+        # Combined = slow fundamentals (quality · value · academic theories) plus a
+        # first-class LIVE market-fit term, then a small strategic geo nudge.
+        # `market` is what makes daily conditions actually move the rankings.
+        geo_nudge = int(round(max(-8, min(8, geo_adj * 0.55))))
+        combined = max(0, min(100, round(
+            0.23 * quality + 0.20 * value + 0.30 * theory + 0.27 * market
+        ) + geo_nudge))
         if combined < min_combined:
             return None
 
@@ -2049,6 +2112,7 @@ def run_value_radar(top_n: int, min_combined: int = 0, region: str = "United Sta
             "value_score":    value,
             "theory_score":   theory,
             "theory_factors": theory_facs,
+            "market_score":   market,
             "geo_adj":        geo_adj,
             "geo_label":      geo_label,
             "geo_reason":     geo_reason,
@@ -2685,11 +2749,13 @@ with tab_vr:
     st.markdown("### 🎯 Value Radar — Best Stocks at Today's Price")
     st.markdown(
         "<span style='color:#8b949e;font-size:0.85rem;'>"
-        "Ranks stocks (US or the region you pick) by a <b>Combined Score</b> built from four dimensions:<br>"
-        "① <b>Quality</b> — margins, ROE, revenue growth, debt/equity &nbsp;·&nbsp; "
-        "② <b>Value-at-Price</b> — FCF yield, earnings yield, analyst upside, balance sheet &nbsp;·&nbsp; "
-        "③ <b>📚 Academic Theories</b> — 10 published frameworks (Fama, Shiller, Graham, Lynch…) &nbsp;·&nbsp; "
-        "④ <b>Geopolitical</b> — macro/political tailwinds &amp; headwinds."
+        "Ranks stocks (US or the region you pick) by a <b>Combined Score</b>:<br>"
+        "① <b>Quality 23%</b> — margins, ROE, growth, debt/equity &nbsp;·&nbsp; "
+        "② <b>Value-at-Price 20%</b> — FCF &amp; earnings yield, upside, balance sheet &nbsp;·&nbsp; "
+        "③ <b>📚 Theories 30%</b> — 10 frameworks (Fama, Shiller, Graham, Lynch…) &nbsp;·&nbsp; "
+        "④ <b>🌍 Live Market 27%</b> — today's relative strength, trend, industry/country "
+        "flows &amp; risk regime &nbsp;·&nbsp; ⑤ <b>Geo nudge</b> — strategic risks.<br>"
+        "<b>①–③ move slowly; ④ changes daily</b> — see the <b>🌍 Market Pulse</b> tab for what's driving it."
         "</span>",
         unsafe_allow_html=True,
     )
@@ -2786,6 +2852,7 @@ with tab_vr:
             qs  = p["quality_score"]
             vs  = p["value_score"]
             ts  = p.get("theory_score", 0)
+            ms  = p.get("market_score", 50)
             ga  = p["geo_adj"]
             try:
                 pe_s = f"{float(p['pe']):.1f}x" if p.get("pe") else "N/A"
@@ -2793,6 +2860,7 @@ with tab_vr:
                 pe_s = "N/A"
 
             ts_color  = "#3fb950" if ts >= 62 else "#f85149" if ts <= 42 else "#d29922"
+            ms_color  = "#3fb950" if ms >= 62 else "#f85149" if ms <= 42 else "#d29922"
             cs_color  = "#3fb950" if cs >= 60 else "#d29922" if cs >= 45 else "#8b949e"
             geo_color = "#3fb950" if ga > 0 else "#f85149" if ga < 0 else "#8b949e"
             geo_sign  = f"+{ga}" if ga > 0 else str(ga)
@@ -2819,6 +2887,7 @@ with tab_vr:
                 f'<span style="color:#8b949e;font-size:0.8rem;">'
                 f' &nbsp;Q:{qs} &nbsp;V:{vs} &nbsp;'
                 f'<span style="color:{ts_color};font-weight:700;">📚 Theory:{ts}</span> &nbsp;'
+                f'<span style="color:{ms_color};font-weight:700;">🌍 Market:{ms}</span> &nbsp;'
                 f'<span style="color:{geo_color};">Geo:{geo_sign}</span>'
                 f'</span><br>'
                 f'<span style="font-size:0.8rem;color:{geo_color};">'
