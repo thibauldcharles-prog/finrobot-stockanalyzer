@@ -610,6 +610,155 @@ def get_market_context() -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DIVERSIFICATION MAP — every major market segment, scored and correlated
+# ══════════════════════════════════════════════════════════════════════════════
+# Diversification isn't "own more stocks" — it's owning things that DON'T move
+# together. So alongside return and risk we compute each segment's correlation to
+# the S&P 500: the lower the correlation, the more genuine diversification it adds.
+# All of it comes from ONE batch download, so it works on rate-limited cloud IPs.
+
+_DIVERSIFY_BUCKETS = {
+    "🇺🇸 US Equity": [
+        ("SPY", "S&P 500 — large cap"), ("RSP", "S&P 500 equal weight"),
+        ("IJH", "US mid cap"), ("IJR", "US small cap"),
+        ("VUG", "US growth"), ("VTV", "US value"), ("SCHD", "US dividend"),
+    ],
+    "🌍 International Developed": [
+        ("VEA", "Developed ex-US"), ("VGK", "Europe"), ("EWJ", "Japan"),
+        ("EWU", "United Kingdom"), ("EWG", "Germany"), ("EWC", "Canada"),
+        ("EWA", "Australia"), ("EWL", "Switzerland"),
+    ],
+    "🌏 Emerging Markets": [
+        ("VWO", "Emerging broad"), ("MCHI", "China"), ("INDA", "India"),
+        ("EWZ", "Brazil"), ("EWY", "South Korea"), ("EWT", "Taiwan"),
+        ("EWW", "Mexico"),
+    ],
+    "🏭 Sectors": [
+        ("XLK", "Technology"), ("XLV", "Healthcare"), ("XLF", "Financials"),
+        ("XLE", "Energy"), ("XLI", "Industrials"), ("XLP", "Consumer Staples"),
+        ("XLY", "Consumer Discretionary"), ("XLU", "Utilities"),
+        ("XLB", "Materials"), ("XLRE", "Real Estate"), ("XLC", "Communications"),
+    ],
+    "🛡️ Bonds & Income": [
+        ("BND", "US aggregate bond"), ("TLT", "20+ yr Treasury"),
+        ("IEF", "7-10 yr Treasury"), ("SHY", "1-3 yr Treasury"),
+        ("LQD", "Investment grade credit"), ("HYG", "High yield"),
+        ("TIP", "Inflation protected"), ("MUB", "Municipal"),
+    ],
+    "🪙 Real Assets": [
+        ("VNQ", "US REITs"), ("GLD", "Gold"), ("SLV", "Silver"),
+        ("DBC", "Broad commodities"), ("DBA", "Agriculture"),
+        ("USO", "Crude oil"), ("URA", "Uranium"),
+    ],
+    "🚀 Thematic Growth": [
+        ("SMH", "Semiconductors"), ("ITA", "Aerospace & Defense"),
+        ("XBI", "Biotech"), ("CIBR", "Cybersecurity"), ("TAN", "Solar"),
+        ("LIT", "Lithium & battery"), ("XHB", "Homebuilders"), ("JETS", "Airlines"),
+    ],
+}
+
+# Target mixes by risk appetite — bucket → % of portfolio
+_ALLOCATION_MODELS = {
+    "Conservative": {"🇺🇸 US Equity": 30, "🌍 International Developed": 10,
+                     "🌏 Emerging Markets": 5,  "🛡️ Bonds & Income": 40,
+                     "🪙 Real Assets": 12, "🚀 Thematic Growth": 3},
+    "Balanced":     {"🇺🇸 US Equity": 40, "🌍 International Developed": 15,
+                     "🌏 Emerging Markets": 8,  "🛡️ Bonds & Income": 22,
+                     "🪙 Real Assets": 10, "🚀 Thematic Growth": 5},
+    "Growth":       {"🇺🇸 US Equity": 48, "🌍 International Developed": 18,
+                     "🌏 Emerging Markets": 12, "🛡️ Bonds & Income": 8,
+                     "🪙 Real Assets": 6,  "🚀 Thematic Growth": 8},
+}
+
+
+def _seg_score(cagr, vol, r3m, mdd, corr) -> int:
+    """0-100 blend of risk-adjusted return, momentum, drawdown and diversification."""
+    score = 0
+    if cagr is not None and vol and vol > 0:
+        sharpe = cagr / vol
+        score += 34 if sharpe > 1.5 else 27 if sharpe > 1.0 else 20 if sharpe > 0.6 \
+                 else 12 if sharpe > 0.3 else 5 if sharpe > 0 else 0
+    if cagr is not None:
+        score += 20 if cagr > 0.15 else 15 if cagr > 0.08 else 9 if cagr > 0.03 \
+                 else 4 if cagr > 0 else 0
+    if r3m is not None:
+        score += 16 if r3m > 0.08 else 11 if r3m > 0.02 else 6 if r3m > -0.03 else 2
+    if mdd is not None:
+        score += 15 if mdd > -0.10 else 11 if mdd > -0.20 else 6 if mdd > -0.35 else 2
+    if corr is not None:
+        # genuine diversification value — low correlation to the S&P earns points
+        score += 15 if corr < 0.2 else 11 if corr < 0.5 else 7 if corr < 0.75 else 3
+    return max(0, min(100, int(round(score))))
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def get_diversification_map() -> dict:
+    """One batch download → return, volatility, drawdown and S&P correlation for
+    every market segment. Returns {} on failure so the UI can explain itself."""
+    syms = [t for b in _DIVERSIFY_BUCKETS.values() for t, _ in b]
+    syms = list(dict.fromkeys(syms + ["SPY"]))
+    try:
+        data = yf.download(syms, period="2y", interval="1d",
+                           progress=False, auto_adjust=True, threads=True)
+    except Exception:
+        return {}
+    if data is None or getattr(data, "empty", True):
+        return {}
+    try:
+        close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+    except Exception:
+        close = data
+    if isinstance(close, pd.Series):
+        close = close.to_frame()
+
+    rets = close.pct_change()
+    # One correlation matrix for the whole frame — far cheaper than pairwise
+    # concat per ticker, and avoids pandas' DatetimeIndex-sort warning.
+    try:
+        corr_spy = rets.corr(min_periods=30)["SPY"] if "SPY" in rets.columns else None
+    except Exception:
+        corr_spy = None
+
+    out = {}
+    for t in syms:
+        try:
+            s = close[t].dropna()
+        except Exception:
+            continue
+        if len(s) < 60:
+            continue
+        last, first = float(s.iloc[-1]), float(s.iloc[0])
+        if last <= 0 or first <= 0:
+            continue
+
+        def _r(days):
+            if len(s) <= days:
+                return None
+            p = float(s.iloc[-days - 1])
+            return (last / p - 1) if p > 0 else None
+
+        years = len(s) / 252.0
+        cagr  = (last / first) ** (1 / years) - 1 if years >= 0.5 else None
+        r_ser = rets[t].dropna()
+        vol   = float(r_ser.std() * np.sqrt(252)) if len(r_ser) > 20 else None
+        mdd   = float((s / s.cummax() - 1).min())
+        corr  = None
+        if corr_spy is not None and t in corr_spy.index:
+            c = corr_spy.get(t)
+            if c is not None and c == c:            # c == c filters NaN
+                corr = float(c)
+
+        out[t] = {
+            "price": last, "r1m": _r(21), "r3m": _r(63), "r1y": _r(252),
+            "cagr": cagr, "vol": vol, "mdd": mdd, "corr": corr,
+            "score": _seg_score(cagr, vol, _r(63), mdd, corr),
+        }
+    if not out:
+        return {}
+    return {"asof": _date.today().isoformat(), "data": out}
+
+
 def _market_score(info: dict, ctx: dict = None) -> int:
     """0-100: how well this stock fits TODAY'S market — its own relative strength
     and trend, plus the live industry / sector / country flows and risk regime.
@@ -2352,7 +2501,8 @@ price = prev = chg = chg_pct = chg_str  = None
 
 _header_slot = st.empty()   # company header injected here when a stock is loaded
 
-tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr, tab_daily, tab_pulse = st.tabs([
+(tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr,
+ tab_daily, tab_pulse, tab_div) = st.tabs([
     "  📊 Overview  ",
     "  📈 Price Chart  ",
     "  🏦 Financials  ",
@@ -2361,6 +2511,7 @@ tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr, tab_daily, tab_pulse = st
     "  🎯 Value Radar  ",
     "  📅 Daily Top 10  ",
     "  🌍 Market Pulse  ",
+    "  🧭 Diversify  ",
 ])
 
 if not sym:
@@ -3246,4 +3397,195 @@ with tab_pulse:
             "(structural facts like sanctions or trade blocs) + 65% live signal from "
             "its country, sector and industry above, tilted by the risk regime. "
             "Educational tooling, not investment advice."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIVERSIFY TAB — every market segment, by asset class, with correlation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_div:
+    st.markdown("### 🧭 Diversify — build across different kinds of markets")
+    st.markdown(
+        "<span style='color:#8b949e;font-size:0.85rem;'>"
+        "Real diversification isn't owning <i>more</i> stocks — it's owning things that "
+        "<b>don't move together</b>. Every segment below is scored on risk-adjusted "
+        "return <b>and</b> its <b>correlation to the S&amp;P 500</b>: the lower the "
+        "correlation, the more genuine diversification it adds to a US-heavy portfolio. "
+        "Measured over 2 years of daily data."
+        "</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
+    _dc1, _dc2 = st.columns([1, 4])
+    with _dc1:
+        if st.button("🔄 Refresh", key="div_refresh", use_container_width=True):
+            get_diversification_map.clear()
+            st.rerun()
+
+    with st.spinner("Mapping market segments (one batch download)…"):
+        try:
+            _dmap = get_diversification_map()
+        except Exception:
+            _dmap = {}
+
+    if not _dmap or not _dmap.get("data"):
+        st.error(
+            "**Could not load segment data.** Yahoo may be rate-limiting this IP — "
+            "try **🔄 Refresh** in a few minutes, or use the desktop app / Shareable "
+            "Link icon which run on your own IP."
+        )
+    else:
+        _dd = _dmap["data"]
+
+        def _corr_rating(c):
+            if c is None:      return "—"
+            if c < 0.15:       return "🟢 excellent"
+            if c < 0.40:       return "🟢 strong"
+            if c < 0.65:       return "🟡 moderate"
+            if c < 0.85:       return "🟠 limited"
+            return "🔴 minimal"
+
+        # ── Best diversifiers up front — the headline insight ─────────────────
+        _label_of = {t: lbl for items in _DIVERSIFY_BUCKETS.values() for t, lbl in items}
+        _cands = [(t, v) for t, v in _dd.items()
+                  if v.get("corr") is not None and t != "SPY" and v.get("score", 0) >= 55]
+        _cands.sort(key=lambda x: x[1]["corr"])
+        if _cands:
+            st.markdown("<div class='section-header'>⭐ Best diversifiers right now</div>",
+                        unsafe_allow_html=True)
+            st.caption("Low correlation to the S&P **and** a solid score — these add the most "
+                       "genuine diversification rather than duplicating what you own.")
+            _cols = st.columns(min(4, len(_cands[:4])))
+            for _i, (_t, _v) in enumerate(_cands[:4]):
+                with _cols[_i]:
+                    st.metric(
+                        f"{_t} · {_label_of.get(_t, _t)[:18]}",
+                        f"corr {_v['corr']:+.2f}",
+                        f"score {_v['score']}/100",
+                        help=f"CAGR {100*(_v['cagr'] or 0):.1f}% · vol {100*(_v['vol'] or 0):.1f}%",
+                    )
+            st.markdown("")
+
+        # ── Segment tables, one per market type ──────────────────────────────
+        for _bucket, _items in _DIVERSIFY_BUCKETS.items():
+            _rows = []
+            for _t, _lbl in _items:
+                _v = _dd.get(_t)
+                if not _v:
+                    continue
+                _rows.append({
+                    "Ticker": _t, "Segment": _lbl,
+                    "Score": _v.get("score", 0),
+                    "1 mo":  round((_v.get("r1m") or 0) * 100, 1),
+                    "3 mo":  round((_v.get("r3m") or 0) * 100, 1),
+                    "1 yr":  round((_v.get("r1y") or 0) * 100, 1),
+                    "Ann. return": round((_v.get("cagr") or 0) * 100, 1),
+                    "Volatility":  round((_v.get("vol") or 0) * 100, 1),
+                    "Worst drop":  round((_v.get("mdd") or 0) * 100, 1),
+                    "Corr S&P":    None if _v.get("corr") is None else round(_v["corr"], 2),
+                    "Diversifies": _corr_rating(_v.get("corr")),
+                })
+            if not _rows:
+                continue
+            _df = pd.DataFrame(_rows).sort_values("Score", ascending=False)
+            st.markdown(f"<div class='section-header'>{_bucket}</div>", unsafe_allow_html=True)
+            st.dataframe(
+                _df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Score":       st.column_config.ProgressColumn(
+                        "Score", min_value=0, max_value=100, format="%d",
+                        help="Risk-adjusted return + momentum + drawdown + diversification value"),
+                    "1 mo":        st.column_config.NumberColumn("1 mo",  format="%+.1f%%"),
+                    "3 mo":        st.column_config.NumberColumn("3 mo",  format="%+.1f%%"),
+                    "1 yr":        st.column_config.NumberColumn("1 yr",  format="%+.1f%%"),
+                    "Ann. return": st.column_config.NumberColumn("Ann. return", format="%+.1f%%",
+                        help="Annualised return over the full 2-year window"),
+                    "Volatility":  st.column_config.NumberColumn("Volatility", format="%.1f%%",
+                        help="Annualised standard deviation — higher means a bumpier ride"),
+                    "Worst drop":  st.column_config.NumberColumn("Worst drop", format="%.1f%%",
+                        help="Largest peak-to-trough fall in the window"),
+                    "Corr S&P":    st.column_config.NumberColumn("Corr S&P", format="%.2f",
+                        help="1.0 = moves identically to the S&P · 0 = unrelated · below 0 = moves opposite"),
+                },
+            )
+            st.markdown("")
+
+        # ── Suggested allocation ─────────────────────────────────────────────
+        st.divider()
+        st.markdown("<div class='section-header'>🧱 Suggested diversified mix</div>",
+                    unsafe_allow_html=True)
+        st.caption(
+            "A starting framework, not advice. Pick a risk appetite and the app fills each "
+            "market bucket with its best-scoring segments, weighted to the target mix."
+        )
+        _pa, _pb = st.columns([1, 3])
+        with _pa:
+            _profile = st.radio("Risk appetite", list(_ALLOCATION_MODELS.keys()),
+                                index=1, key="div_profile")
+            _per_bucket = st.selectbox("Holdings per bucket", [1, 2, 3], index=1,
+                                       key="div_perbucket")
+        _model = _ALLOCATION_MODELS[_profile]
+
+        _alloc = []
+        for _bucket, _pct in _model.items():
+            _items = _DIVERSIFY_BUCKETS.get(_bucket, [])
+            _ranked = sorted(
+                [(t, l, _dd[t]) for t, l in _items if t in _dd],
+                key=lambda x: -x[2].get("score", 0),
+            )[:_per_bucket]
+            if not _ranked:
+                continue
+            # Weight within a bucket proportional to score, so better segments get more
+            _tot = sum(max(1, r[2].get("score", 0)) for r in _ranked)
+            for _t, _l, _v in _ranked:
+                _w = _pct * max(1, _v.get("score", 0)) / _tot
+                _alloc.append({
+                    "Bucket": _bucket, "Ticker": _t, "Segment": _l,
+                    "Weight": round(_w, 1), "Score": _v.get("score", 0),
+                    "Corr S&P": None if _v.get("corr") is None else round(_v["corr"], 2),
+                    "Ann. return": round((_v.get("cagr") or 0) * 100, 1),
+                    "Volatility": round((_v.get("vol") or 0) * 100, 1),
+                })
+        with _pb:
+            if _alloc:
+                _adf = pd.DataFrame(_alloc).sort_values("Weight", ascending=False)
+                st.dataframe(
+                    _adf, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Weight":      st.column_config.NumberColumn("Weight", format="%.1f%%"),
+                        "Score":       st.column_config.ProgressColumn(
+                            "Score", min_value=0, max_value=100, format="%d"),
+                        "Corr S&P":    st.column_config.NumberColumn("Corr S&P", format="%.2f"),
+                        "Ann. return": st.column_config.NumberColumn("Ann. return", format="%+.1f%%"),
+                        "Volatility":  st.column_config.NumberColumn("Volatility", format="%.1f%%"),
+                    },
+                )
+                # Blended portfolio stats — the payoff of diversifying
+                _wsum = sum(a["Weight"] for a in _alloc) or 1
+                _bret = sum(a["Ann. return"] * a["Weight"] for a in _alloc) / _wsum
+                _bcor = sum((a["Corr S&P"] or 0) * a["Weight"] for a in _alloc) / _wsum
+                # Weighted-average vol overstates real risk: correlation < 1 reduces it.
+                _bvol_naive = sum(a["Volatility"] * a["Weight"] for a in _alloc) / _wsum
+                _spy_vol = (_dd.get("SPY", {}).get("vol") or 0) * 100
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Blended return", f"{_bret:+.1f}%", help="Weighted annualised return")
+                k2.metric("Avg correlation", f"{_bcor:.2f}",
+                          help="Lower means the holdings genuinely offset each other")
+                k3.metric("Naive volatility", f"{_bvol_naive:.1f}%",
+                          help="Weighted average — real portfolio vol is LOWER because correlations are below 1")
+                k4.metric("S&P volatility", f"{_spy_vol:.1f}%",
+                          help="For comparison: holding the S&P alone")
+                st.caption(
+                    "Holdings are weighted by score within each bucket. The naive volatility "
+                    "figure is an upper bound — because these segments aren't perfectly "
+                    "correlated, a real blend would sit below it. That gap is the "
+                    "diversification benefit."
+                )
+        st.markdown("")
+        st.caption(
+            "⚠️ Educational tooling, not investment advice. Past return, volatility and "
+            "correlation do not predict future results — correlations in particular tend to "
+            "rise toward 1 during market crises, exactly when diversification is needed most."
         )
