@@ -17,6 +17,7 @@ from plotly.subplots import make_subplots
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as _date
 import time
+import json
 
 st.set_page_config(
     page_title="FinRobot Stock Analyzer",
@@ -2441,6 +2442,246 @@ def get_daily_picks(n: int = 10) -> dict:
     return {"stocks": stocks, "etfs": etfs}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# POSITION TRACKER — when to buy more, hold, trim or sell what you already own
+# ══════════════════════════════════════════════════════════════════════════════
+# Scoring a stock you DON'T own ("is this attractive?") is a different question
+# from scoring one you DO own ("should I still be in it?"). The second has extra
+# inputs the screeners ignore: your entry price, your unrealised P&L, the peak it
+# reached since you bought, and your own risk limits. This engine combines hard
+# risk rules (stop-loss, trailing stop, profit target) with the thesis score,
+# valuation and technicals, and always shows the reasoning behind the call.
+
+_POSITIONS_PATH = Path(__file__).parent / "positions.json"
+
+
+def load_positions() -> list:
+    """Read saved positions from disk. Returns [] if absent or unreadable."""
+    try:
+        if _POSITIONS_PATH.exists():
+            with open(_POSITIONS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [p for p in data if isinstance(p, dict) and p.get("symbol")]
+    except Exception:
+        pass
+    return []
+
+
+def save_positions(positions: list) -> bool:
+    try:
+        with open(_POSITIONS_PATH, "w", encoding="utf-8") as f:
+            json.dump(positions, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _position_tech(symbols: tuple) -> dict:
+    """One batch download of 1y daily prices for held symbols → RSI, moving
+    averages, 52-week range, volatility and the price path (so a trailing stop can
+    be measured from the peak since each entry date)."""
+    out = {}
+    syms = [s for s in symbols if s]
+    if not syms:
+        return out
+    try:
+        data = yf.download(syms, period="1y", interval="1d",
+                           progress=False, auto_adjust=True, threads=True)
+    except Exception:
+        return out
+    if data is None or getattr(data, "empty", True):
+        return out
+    try:
+        close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
+    except Exception:
+        close = data
+    if isinstance(close, pd.Series):
+        close = close.to_frame(name=syms[0])
+
+    for sym in syms:
+        try:
+            s = close[sym].dropna() if sym in close.columns else None
+        except Exception:
+            s = None
+        if s is None or len(s) < 30:
+            continue
+        last = float(s.iloc[-1])
+        if last <= 0:
+            continue
+        try:
+            rsi_series = _rsi(s).dropna()
+            rsi = float(rsi_series.iloc[-1]) if len(rsi_series) else None
+        except Exception:
+            rsi = None
+        rets = s.pct_change().dropna()
+        out[sym] = {
+            "last":  last,
+            "rsi":   rsi,
+            "ma50":  float(s.tail(50).mean())  if len(s) >= 50  else None,
+            "ma200": float(s.tail(200).mean()) if len(s) >= 200 else None,
+            "hi52":  float(s.max()),
+            "lo52":  float(s.min()),
+            "vol":   float(rets.std() * np.sqrt(252)) if len(rets) > 20 else None,
+            # Price path, kept small (dates as ISO strings) for the trailing stop
+            "dates": [d.strftime("%Y-%m-%d") for d in s.index],
+            "prices": [float(x) for x in s.values],
+        }
+    return out
+
+
+def _peak_since(tech: dict, entry_date: str):
+    """Highest close since the entry date (falls back to the full 1y peak)."""
+    if not tech:
+        return None
+    dates, prices = tech.get("dates") or [], tech.get("prices") or []
+    if not dates or not prices:
+        return tech.get("hi52")
+    if entry_date:
+        vals = [p for d, p in zip(dates, prices) if d >= entry_date]
+        if vals:
+            return max(vals)
+    return tech.get("hi52")
+
+
+def _position_signal(pos: dict, info: dict, tech: dict, ctx: dict, settings: dict) -> dict:
+    """Decide ADD / HOLD / TRIM / SELL for one held position, with reasoning."""
+    info = info or {}
+    tech = tech or {}
+    entry = float(pos.get("entry_price") or 0) or None
+    shares = float(pos.get("shares") or 0)
+    price = tech.get("last") or _ff(info, "currentPrice", "regularMarketPrice")
+    currency = info.get("currency", "USD")
+
+    stop_pct  = float(settings.get("stop_loss", 15))
+    take_pct  = float(settings.get("take_profit", 30))
+    trail_pct = float(settings.get("trail", 12))
+
+    buy_p, sell_p = 0.0, 0.0
+    reasons, cautions = [], []
+
+    pnl_pct = ((price / entry) - 1) * 100 if (entry and price) else None
+
+    # ── Thesis: reuse the same composite the screeners rank on ────────────────
+    q = _score_stock(info)
+    v = _value_at_price_score(info)
+    t = _theory_composite(_theory_factors(info))
+    m = _market_score(info, ctx)
+    score = int(round(0.23 * q + 0.20 * v + 0.30 * t + 0.27 * m)) if info else 50
+
+    # ── 1. Hard risk rules come first — they override opinion ─────────────────
+    if pnl_pct is not None and pnl_pct <= -stop_pct:
+        sell_p += 45
+        cautions.append(f"🛑 **Stop-loss breached** — down {pnl_pct:.1f}% vs your −{stop_pct:.0f}% limit")
+
+    peak = _peak_since(tech, pos.get("entry_date", ""))
+    off_peak = ((price / peak) - 1) * 100 if (peak and price and peak > 0) else None
+    if off_peak is not None and off_peak <= -trail_pct and (pnl_pct or 0) > 0:
+        sell_p += 26
+        cautions.append(
+            f"📉 **Trailing stop** — {off_peak:.1f}% below its {_fmt_price(peak, currency)} "
+            f"peak since you bought (limit −{trail_pct:.0f}%)"
+        )
+
+    if pnl_pct is not None and pnl_pct >= take_pct:
+        if score < 55 or (tech.get("rsi") or 50) > 70:
+            sell_p += 24
+            cautions.append(
+                f"🎯 **Profit target hit** (+{pnl_pct:.1f}%) and momentum cooling — "
+                f"consider taking some off the table"
+            )
+        else:
+            reasons.append(
+                f"🎯 Up {pnl_pct:.1f}% and the thesis still holds — let it run, but raise your stop"
+            )
+
+    # ── 2. Is the original reason for owning it still true? ───────────────────
+    if score >= 65:
+        buy_p += 22; reasons.append(f"✅ Thesis intact — composite score {score}/100")
+    elif score >= 52:
+        buy_p += 8;  reasons.append(f"⚪ Thesis adequate — composite score {score}/100")
+    elif score >= 40:
+        sell_p += 14; cautions.append(f"⚠️ Thesis weakening — composite score {score}/100")
+    else:
+        sell_p += 32; cautions.append(f"🔴 **Thesis broken** — composite score {score}/100")
+
+    # ── 3. Valuation vs analyst consensus ─────────────────────────────────────
+    target = _ff(info, "targetMeanPrice")
+    if target and price:
+        up = ((target / price) - 1) * 100
+        if up > 20:
+            buy_p += 16; reasons.append(f"📈 {up:.0f}% upside to analyst target {_fmt_price(target, currency)}")
+        elif up > 5:
+            buy_p += 7;  reasons.append(f"📈 {up:.0f}% upside to analyst target")
+        elif up < -10:
+            sell_p += 18
+            cautions.append(f"📉 Trading {abs(up):.0f}% **above** analyst target {_fmt_price(target, currency)}")
+
+    # ── 4. Technical overlay ──────────────────────────────────────────────────
+    rsi = tech.get("rsi")
+    if rsi is not None:
+        if rsi > 75:
+            sell_p += 14; cautions.append(f"🌡️ RSI {rsi:.0f} — overbought, near-term pullback risk")
+        elif rsi > 65:
+            sell_p += 5
+        elif rsi < 30:
+            buy_p += 15; reasons.append(f"🌡️ RSI {rsi:.0f} — oversold; a dip to add if the thesis holds")
+        elif rsi < 40:
+            buy_p += 5
+    ma50, ma200 = tech.get("ma50"), tech.get("ma200")
+    if price and ma200:
+        if price < ma200:
+            sell_p += 12; cautions.append("📉 Below its 200-day average — primary trend is down")
+        else:
+            buy_p += 8;  reasons.append("📈 Above its 200-day average — primary trend is up")
+    if ma50 and ma200 and ma50 < ma200:
+        sell_p += 8; cautions.append("📉 50-day below 200-day (death cross)")
+
+    # ── 5. Does today's market favour it? ─────────────────────────────────────
+    if m >= 65:
+        buy_p += 10; reasons.append(f"🌍 Current market conditions favour it (market fit {m}/100)")
+    elif m <= 38:
+        sell_p += 12; cautions.append(f"🌍 Current market conditions work against it (market fit {m}/100)")
+
+    net = buy_p - sell_p
+    if   net >= 25:  action, color, icon = "BUY MORE",  "#3fb950", "🟢"
+    elif net >= 8:   action, color, icon = "HOLD / ADD ON DIPS", "#2ea043", "🟢"
+    elif net >= -8:  action, color, icon = "HOLD",      "#d29922", "🟡"
+    elif net >= -28: action, color, icon = "TRIM",      "#f0883e", "🟠"
+    else:            action, color, icon = "SELL",      "#f85149", "🔴"
+
+    # ── Suggested levels: tightest sensible stop, and the profit target ───────
+    # The trailing stop sits above the fixed stop once a position is in profit, so
+    # take whichever is HIGHER (tighter). If that level is already above the current
+    # price the stop is breached, not an order level — flag it rather than show a
+    # nonsensical "place your stop here" number above the market.
+    hard_stop  = entry * (1 - stop_pct / 100) if entry else None
+    trail_stop = peak * (1 - trail_pct / 100) if peak else None
+    rec_stop   = max([x for x in (hard_stop, trail_stop) if x] or [0]) or None
+    target_lvl = entry * (1 + take_pct / 100) if entry else None
+    stop_breached = bool(rec_stop and price and rec_stop >= price)
+    target_hit    = bool(target_lvl and price and price >= target_lvl)
+
+    return {
+        "symbol": pos.get("symbol"), "action": action, "color": color, "icon": icon,
+        "conviction": min(100, int(abs(net) * 2.2)), "net": round(net, 1),
+        "price": price, "entry": entry, "shares": shares, "currency": currency,
+        "pnl_pct": pnl_pct,
+        "pnl_abs": ((price - entry) * shares) if (price and entry and shares) else None,
+        "value": (price * shares) if (price and shares) else None,
+        "cost":  (entry * shares) if (entry and shares) else None,
+        "score": score, "q": q, "v": v, "t": t, "m": m,
+        "rsi": rsi, "peak": peak, "off_peak": off_peak,
+        "target": target, "sector": info.get("sector", "N/A"),
+        "name": info.get("shortName") or info.get("longName") or pos.get("symbol"),
+        "reasons": reasons, "cautions": cautions,
+        "stop_level": rec_stop, "target_level": target_lvl,
+        "stop_breached": stop_breached, "target_hit": target_hit,
+        "has_data": bool(info) or bool(tech),
+    }
+
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 for _k, _v in {
@@ -2448,6 +2689,7 @@ for _k, _v in {
     "vr_picks": None, "vr_total": 0,
     "picks_results": None, "picks_total": 0, "picks_found": 0,
     "daily_picks": None,
+    "positions": load_positions(),
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -2501,8 +2743,9 @@ price = prev = chg = chg_pct = chg_str  = None
 
 _header_slot = st.empty()   # company header injected here when a stock is loaded
 
-(tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr,
+(tab_pos, tab_ov, tab_chart, tab_fin, tab_ai, tab_picks, tab_vr,
  tab_daily, tab_pulse, tab_div) = st.tabs([
+    "  💼 My Positions  ",
     "  📊 Overview  ",
     "  📈 Price Chart  ",
     "  🏦 Financials  ",
@@ -3589,3 +3832,304 @@ with tab_div:
             "correlation do not predict future results — correlations in particular tend to "
             "rise toward 1 during market crises, exactly when diversification is needed most."
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MY POSITIONS TAB — buy / hold / trim / sell calls on what you already own
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_pos:
+    st.markdown("### 💼 My Positions — when to buy more, hold, trim or sell")
+    st.markdown(
+        "<span style='color:#8b949e;font-size:0.85rem;'>"
+        "Enter what you actually bought and at what price. Each holding is then judged "
+        "on your <b>risk limits</b> (stop-loss, trailing stop, profit target) plus the "
+        "<b>thesis score</b>, analyst valuation, technicals and today's market — and you "
+        "get a clear call with the reasoning behind it."
+        "</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
+    # ── Add a position ────────────────────────────────────────────────────────
+    with st.expander("➕ Add a holding", expanded=not st.session_state.positions):
+        f1, f2, f3, f4, f5 = st.columns([1.1, 1, 1, 1.1, 0.8])
+        with f1:
+            _p_sym = st.text_input("Ticker", placeholder="AAPL", key="pos_sym").strip().upper()
+        with f2:
+            _p_shares = st.number_input("Shares", min_value=0.0, value=0.0,
+                                        step=1.0, key="pos_shares")
+        with f3:
+            _p_entry = st.number_input("Entry price", min_value=0.0, value=0.0,
+                                       step=0.01, format="%.2f", key="pos_entry")
+        with f4:
+            _p_date = st.date_input("Bought on", value=_date.today(), key="pos_date")
+        with f5:
+            st.markdown("")
+            st.markdown("")
+            _p_add = st.button("Add", type="primary", use_container_width=True, key="pos_add")
+        if _p_add:
+            if not _p_sym:
+                st.warning("Enter a ticker symbol.")
+            elif _p_shares <= 0 or _p_entry <= 0:
+                st.warning("Shares and entry price must both be greater than zero.")
+            else:
+                _pl = list(st.session_state.positions)
+                _pl.append({
+                    "symbol": _p_sym, "shares": _p_shares, "entry_price": _p_entry,
+                    "entry_date": _p_date.isoformat(),
+                })
+                st.session_state.positions = _pl
+                _ok = save_positions(_pl)
+                st.success(f"Added {_p_shares:g} × {_p_sym} @ {_p_entry:.2f}"
+                           + ("" if _ok else " (could not write positions.json — session only)"))
+                st.rerun()
+
+    # ── Risk settings ─────────────────────────────────────────────────────────
+    with st.expander("⚙️ My risk rules"):
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            _stop = st.slider("Stop-loss (%)", 5, 40, 15, key="pos_stop",
+                              help="Sell if a holding falls this far below YOUR entry price")
+        with r2:
+            _trail = st.slider("Trailing stop (%)", 5, 35, 12, key="pos_trail",
+                               help="Sell if it falls this far from its peak since you bought — locks in gains")
+        with r3:
+            _take = st.slider("Profit target (%)", 10, 150, 30, key="pos_take",
+                              help="At this gain, start trimming IF momentum is fading")
+        st.caption(
+            "These drive the hard rules. Everything else (thesis, valuation, technicals, "
+            "market fit) is judgement layered on top — and risk rules win when they conflict."
+        )
+    _settings = {"stop_loss": _stop, "take_profit": _take, "trail": _trail}
+
+    _positions = list(st.session_state.positions)
+
+    if not _positions:
+        st.info(
+            "No holdings yet. Add one above to get buy/sell guidance. "
+            "You can also paste a CSV further down if you keep a portfolio elsewhere."
+        )
+    else:
+        with st.spinner(f"Analysing {len(_positions)} holding(s)…"):
+            _syms = tuple(sorted({p["symbol"] for p in _positions}))
+            try:
+                _tech_all = _position_tech(_syms)
+            except Exception:
+                _tech_all = {}
+            try:
+                _pctx = get_market_context()
+            except Exception:
+                _pctx = {}
+            _sigs = []
+            for _p in _positions:
+                _s = _p["symbol"]
+                try:
+                    _inf = _get_info_cached(_s) or {}
+                except Exception:
+                    _inf = {}
+                _sigs.append(_position_signal(_p, _inf, _tech_all.get(_s, {}), _pctx, _settings))
+
+        _priced = [s for s in _sigs if s.get("value")]
+        _tot_val  = sum(s["value"] for s in _priced)
+        _tot_cost = sum(s["cost"] for s in _priced if s.get("cost"))
+        _tot_pnl  = _tot_val - _tot_cost if _tot_cost else None
+
+        # ── Portfolio summary ────────────────────────────────────────────────
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Portfolio value", f"${_tot_val:,.0f}" if _tot_val else "N/A")
+        s2.metric("Total cost", f"${_tot_cost:,.0f}" if _tot_cost else "N/A")
+        s3.metric(
+            "Unrealised P&L",
+            f"${_tot_pnl:,.0f}" if _tot_pnl is not None else "N/A",
+            f"{(_tot_pnl / _tot_cost * 100):+.1f}%" if (_tot_pnl is not None and _tot_cost) else None,
+        )
+        _acts = [s["action"] for s in _sigs]
+        _urgent = sum(1 for a in _acts if a in ("SELL", "TRIM"))
+        s4.metric("Needs attention", f"{_urgent}/{len(_sigs)}",
+                  help="Holdings flagged SELL or TRIM")
+        st.markdown("")
+
+        # ── Action summary table ─────────────────────────────────────────────
+        _rank = {"SELL": 0, "TRIM": 1, "HOLD": 2, "HOLD / ADD ON DIPS": 3, "BUY MORE": 4}
+        _rows = []
+        for s in sorted(_sigs, key=lambda x: _rank.get(x["action"], 9)):
+            _rows.append({
+                "Action": f"{s['icon']} {s['action']}",
+                "Ticker": s["symbol"],
+                "Name": (s["name"] or "")[:26],
+                "Shares": s["shares"],
+                "Entry": s["entry"],
+                "Price": s["price"],
+                "P&L %": round(s["pnl_pct"], 1) if s["pnl_pct"] is not None else None,
+                "P&L $": round(s["pnl_abs"], 0) if s["pnl_abs"] is not None else None,
+                "Value": round(s["value"], 0) if s["value"] else None,
+                "Weight %": round(s["value"] / _tot_val * 100, 1) if (s.get("value") and _tot_val) else None,
+                "Score": s["score"],
+                "Conviction": s["conviction"],
+            })
+        st.dataframe(
+            pd.DataFrame(_rows), use_container_width=True, hide_index=True,
+            column_config={
+                "Entry":  st.column_config.NumberColumn("Entry",  format="%.2f"),
+                "Price":  st.column_config.NumberColumn("Price",  format="%.2f"),
+                "P&L %":  st.column_config.NumberColumn("P&L %",  format="%+.1f%%"),
+                "P&L $":  st.column_config.NumberColumn("P&L $",  format="%+.0f"),
+                "Value":  st.column_config.NumberColumn("Value",  format="%.0f"),
+                "Weight %": st.column_config.NumberColumn("Weight %", format="%.1f%%",
+                            help="Share of your portfolio — above ~25% is concentrated"),
+                "Score":  st.column_config.ProgressColumn("Score", min_value=0, max_value=100,
+                            format="%d", help="Composite thesis score — same engine as Value Radar"),
+                "Conviction": st.column_config.ProgressColumn("Conviction", min_value=0,
+                            max_value=100, format="%d", help="How strong the signal is"),
+            },
+        )
+
+        # ── Concentration warnings ───────────────────────────────────────────
+        _warn = []
+        for s in _priced:
+            _w = s["value"] / _tot_val * 100 if _tot_val else 0
+            if _w > 25:
+                _warn.append(f"**{s['symbol']}** is {_w:.0f}% of your portfolio")
+        _secs = {}
+        for s in _priced:
+            _secs[s["sector"]] = _secs.get(s["sector"], 0) + s["value"]
+        for _sec, _val in _secs.items():
+            _w = _val / _tot_val * 100 if _tot_val else 0
+            if _w > 40 and _sec != "N/A":
+                _warn.append(f"**{_sec}** is {_w:.0f}% of your portfolio")
+        if _warn:
+            st.warning(
+                "⚖️ **Concentration risk** — " + " · ".join(_warn) +
+                ". A single position or sector dominating means your outcome rides on it. "
+                "The **🧭 Diversify** tab shows low-correlation segments to balance against."
+            )
+        st.markdown("")
+
+        # ── Per-holding detail ───────────────────────────────────────────────
+        st.markdown("<div class='section-header'>📋 The reasoning, holding by holding</div>",
+                    unsafe_allow_html=True)
+        for s in sorted(_sigs, key=lambda x: _rank.get(x["action"], 9)):
+            _cur = s.get("currency", "USD")
+            if not s.get("has_data"):
+                st.error(f"**{s['symbol']}** — no live data (Yahoo may be rate-limiting). "
+                         f"Signal unavailable; try again in a few minutes.")
+                continue
+            _pnl_txt  = f"{s['pnl_pct']:+.1f}%" if s["pnl_pct"] is not None else "N/A"
+            _pnl_col  = "#3fb950" if (s["pnl_pct"] or 0) > 0 else "#f85149"
+            _pnl_cash = f" ({s['pnl_abs']:+,.0f})" if s.get("pnl_abs") is not None else ""
+            _price_s  = _fmt_price(s["price"], _cur) if s["price"] else "N/A"
+            _entry_s  = _fmt_price(s["entry"], _cur) if s["entry"] else "N/A"
+            _rsi_s    = f" &nbsp;·&nbsp; RSI {s['rsi']:.0f}" if s.get("rsi") is not None else ""
+            st.markdown(
+                f'<div class="pick-card">'
+                f'<b style="font-size:1.05rem;color:#e6edf3;">{s["icon"]} {s["symbol"]} — {s["name"]}</b>'
+                f'<span style="float:right;font-size:1rem;font-weight:700;color:{s["color"]};">'
+                f'{s["action"]} &nbsp;<span style="font-size:0.78rem;color:#8b949e;">'
+                f'conviction {s["conviction"]}/100</span></span><br>'
+                f'<span style="font-size:1.2rem;font-weight:700;color:#388bfd;">{_price_s}</span>'
+                f'<span style="color:#8b949e;font-size:0.82rem;"> &nbsp;from entry {_entry_s}'
+                f' &nbsp;·&nbsp; <b style="color:{_pnl_col};">{_pnl_txt}{_pnl_cash}</b>'
+                f' &nbsp;·&nbsp; {s["shares"]:g} shares'
+                f' &nbsp;·&nbsp; {s.get("sector","N/A")}</span><br>'
+                f'<span style="color:#8b949e;font-size:0.8rem;">'
+                f'Thesis {s["score"]}/100 &nbsp; (Q:{s["q"]} V:{s["v"]} 📚{s["t"]} 🌍{s["m"]})'
+                f'{_rsi_s}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            d1, d2 = st.columns(2)
+            with d1:
+                if s["reasons"]:
+                    st.markdown("**Supports holding / adding**")
+                    for _r in s["reasons"]:
+                        st.markdown(f"- {_r}")
+                else:
+                    st.markdown("**Supports holding / adding**\n\n- Nothing notable.")
+            with d2:
+                if s["cautions"]:
+                    st.markdown("**Reasons for caution**")
+                    for _c in s["cautions"]:
+                        st.markdown(f"- {_c}")
+                else:
+                    st.markdown("**Reasons for caution**\n\n- Nothing notable.")
+            l1, l2, l3 = st.columns(3)
+            l1.metric(
+                "⚠️ Stop BREACHED at" if s.get("stop_breached") else "Suggested stop",
+                _fmt_price(s["stop_level"], _cur) if s["stop_level"] else "N/A",
+                "already above price" if s.get("stop_breached") else None,
+                delta_color="inverse" if s.get("stop_breached") else "normal",
+                help="The tighter of your fixed stop-loss and your trailing stop. If it is "
+                     "already above the current price, the exit rule has triggered.",
+            )
+            l2.metric(
+                "✅ Target HIT at" if s.get("target_hit") else "Profit target",
+                _fmt_price(s["target_level"], _cur) if s["target_level"] else "N/A",
+                "passed — trail the stop instead" if s.get("target_hit") else None,
+                help="Your take-profit level measured from entry. Once passed, the trailing "
+                     "stop becomes the level that matters.",
+            )
+            l3.metric("Peak since entry",
+                      _fmt_price(s["peak"], _cur) if s["peak"] else "N/A",
+                      f"{s['off_peak']:+.1f}% from peak" if s.get("off_peak") is not None else None)
+            b1, b2, _ = st.columns([1, 1, 3])
+            with b1:
+                if st.button("📊 Deep-dive", key=f"pos_dd_{s['symbol']}"):
+                    st.session_state.symbol = s["symbol"]
+                    st.session_state.loaded = False
+                    st.session_state.analyses = {}
+                    st.rerun()
+            with b2:
+                if st.button("🗑 Remove", key=f"pos_rm_{s['symbol']}"):
+                    _pl = [p for p in st.session_state.positions if p["symbol"] != s["symbol"]]
+                    st.session_state.positions = _pl
+                    save_positions(_pl)
+                    st.rerun()
+            st.markdown("")
+
+        # ── Save / load ──────────────────────────────────────────────────────
+        st.divider()
+        st.markdown("<div class='section-header'>💾 Back up your portfolio</div>",
+                    unsafe_allow_html=True)
+        st.caption(
+            f"Holdings are saved to `positions.json` next to the app, so they survive "
+            f"restarts on **this PC**. On the cloud link the filesystem resets whenever the "
+            f"app redeploys — download the CSV to keep a durable copy."
+        )
+        _csv = pd.DataFrame(_positions).to_csv(index=False)
+        e1, e2 = st.columns(2)
+        with e1:
+            st.download_button("⬇ Download CSV", data=_csv, file_name="my_positions.csv",
+                               mime="text/csv", use_container_width=True)
+        with e2:
+            _up = st.file_uploader("⬆ Restore from CSV", type=["csv"], key="pos_upload")
+            if _up is not None:
+                try:
+                    _idf = pd.read_csv(_up)
+                    _need = {"symbol", "shares", "entry_price"}
+                    if not _need.issubset({c.lower() for c in _idf.columns}):
+                        st.error(f"CSV needs at least these columns: {', '.join(sorted(_need))}")
+                    else:
+                        _idf.columns = [c.lower() for c in _idf.columns]
+                        _new = []
+                        for _, _row in _idf.iterrows():
+                            _new.append({
+                                "symbol": str(_row["symbol"]).strip().upper(),
+                                "shares": float(_row["shares"]),
+                                "entry_price": float(_row["entry_price"]),
+                                "entry_date": str(_row.get("entry_date", "") or ""),
+                            })
+                        st.session_state.positions = _new
+                        save_positions(_new)
+                        st.success(f"Restored {len(_new)} holding(s).")
+                        st.rerun()
+                except Exception as _ex:
+                    st.error(f"Could not read that CSV: {_ex}")
+
+    st.markdown("")
+    st.caption(
+        "⚠️ **Educational tooling, not investment advice.** These are rule-based signals "
+        "from historical and consensus data — they cannot know your tax position, time "
+        "horizon or anything the market hasn't priced yet. Risk rules fire on past prices "
+        "and a gap-down can skip straight through a stop. Decide for yourself."
+    )

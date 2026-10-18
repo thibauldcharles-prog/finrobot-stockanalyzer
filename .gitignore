@@ -15,3 +15,5 @@ current_link.txt
 # OS
 Thumbs.db
 .DS_Store
+
+positions.json
