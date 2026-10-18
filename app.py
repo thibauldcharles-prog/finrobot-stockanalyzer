@@ -2796,7 +2796,12 @@ def _position_signal(pos: dict, info: dict, tech: dict, ctx: dict, settings: dic
     # price the stop is breached, not an order level — flag it rather than show a
     # nonsensical "place your stop here" number above the market.
     hard_stop  = entry * (1 - stop_pct / 100) if entry else None
-    trail_stop = peak * (1 - trail_pct / 100) if peak else None
+    # A trailing stop protects GAINS, so it only applies once a position is in
+    # profit. Applying it to a loser would use a peak that may predate the purchase
+    # (especially when the broker export has no entry date) and wrongly report the
+    # stop as breached when the fixed stop is nowhere near.
+    in_profit  = (pnl_pct or 0) > 0
+    trail_stop = peak * (1 - trail_pct / 100) if (peak and in_profit) else None
     rec_stop   = max([x for x in (hard_stop, trail_stop) if x] or [0]) or None
     target_lvl = entry * (1 + take_pct / 100) if entry else None
     stop_breached = bool(rec_stop and price and rec_stop >= price)
@@ -4189,6 +4194,22 @@ with tab_pos:
         _urgent = sum(1 for a in _acts if a in ("SELL", "TRIM"))
         s4.metric("Needs attention", f"{_urgent}/{len(_sigs)}",
                   help="Holdings flagged SELL or TRIM")
+
+        # Totals are a plain sum of each holding's own currency — no FX conversion.
+        _ccys = sorted({s.get("currency", "USD") for s in _priced})
+        if len(_ccys) > 1:
+            st.caption(
+                f"⚠️ Your holdings span **{', '.join(_ccys)}** and these totals are a "
+                f"straight sum **without currency conversion**, so the portfolio value and "
+                f"P&L above are indicative only. Each holding's own P&L % is correct — "
+                f"it compares like with like in its own currency."
+            )
+        if any(not p.get("entry_date") for p in _positions):
+            st.caption(
+                "ℹ️ Some holdings have no purchase date, so the trailing stop measures from "
+                "the 52-week peak rather than the peak since you actually bought. Add dates "
+                "(edit `positions.json` or re-import with a date column) for exact trailing stops."
+            )
         st.markdown("")
 
         # ── Action summary table ─────────────────────────────────────────────
