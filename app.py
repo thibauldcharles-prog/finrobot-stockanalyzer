@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as _date
 import time
 import json
+import re
 
 st.set_page_config(
     page_title="FinRobot Stock Analyzer",
@@ -2455,6 +2456,144 @@ def get_daily_picks(n: int = 10) -> dict:
 _POSITIONS_PATH = Path(__file__).parent / "positions.json"
 
 
+# ── Pasting from a broker / shares site ───────────────────────────────────────
+# Copying a portfolio table out of a broker page gives wildly varying text: tabs
+# or semicolons, "1,234.56" or "1.234,56", currency symbols, company names with
+# spaces, extra columns. These helpers parse tolerantly and then let the user
+# confirm the column mapping, rather than guessing silently and getting it wrong.
+
+_CCY_CHARS = "$€£¥₹"
+
+
+def _parse_number(tok):
+    """Pull a number out of broker text. Handles currency symbols, thousands
+    separators, (123) negatives and both 1,234.56 (US) and 1.234,56 (EU)."""
+    if tok is None:
+        return None
+    s = str(tok).strip()
+    if not s:
+        return None
+    neg = s.startswith("(") and s.endswith(")")       # accounting negatives
+    s = s.strip("()")
+    for ch in _CCY_CHARS:
+        s = s.replace(ch, "")
+    for junk in (" ", " ", "%", "'", '"', "USD", "EUR", "GBP", "CHF", "+"):
+        s = s.replace(junk, "")
+    if not s or s in ("-", "."):
+        return None
+    has_dot, has_com = "." in s, "," in s
+    if has_dot and has_com:
+        # whichever separator comes last is the decimal point
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif has_com:
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            s = s.replace(",", ".")                   # 620,50 → 620.50
+        else:
+            s = s.replace(",", "")                    # 1,234 → 1234
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def _looks_like_ticker(tok) -> bool:
+    t = str(tok).strip().upper()
+    if not (1 <= len(t) <= 12):
+        return False
+    return bool(re.fullmatch(r"[A-Z]{1,6}([.\-][A-Z0-9]{1,4})?", t))
+
+
+def _parse_pasted_positions(text: str):
+    """Split pasted text into a DataFrame, auto-detecting the delimiter and
+    dropping a header row if there is one."""
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    if not lines:
+        return None
+    n = len(lines)
+    tabs = sum(l.count("\t") for l in lines)
+    semis = sum(l.count(";") for l in lines)
+    commas = sum(l.count(",") for l in lines)
+    if tabs >= n:
+        delim = "\t"
+    elif semis >= n:
+        delim = ";"
+    elif commas >= n * 2:
+        delim = ","            # needs several per line to really be a CSV
+    else:
+        delim = None           # fall back to runs of whitespace
+
+    rows = []
+    for l in lines:
+        cells = [c.strip() for c in l.split(delim)] if delim else re.split(r"\s+", l.strip())
+        rows.append(cells)
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    df = pd.DataFrame(rows, columns=[f"col{i + 1}" for i in range(width)])
+
+    _hdr_words = {
+        "symbol", "ticker", "name", "product", "qty", "quantity", "shares", "units",
+        "price", "cost", "avg", "average", "value", "date", "bought", "purchase",
+        "amount", "position", "aantal", "stuks", "koers", "aankoop", "gak", "waarde",
+    }
+    first = rows[0]
+    looks_header = (
+        any(any(w in str(c).lower() for w in _hdr_words) for c in first)
+        and not any(_parse_number(c) is not None for c in first)
+    )
+    if looks_header and len(rows) > 1:
+        df.columns = [str(c).strip() or f"col{i + 1}" for i, c in enumerate(first)]
+        df = df.iloc[1:].reset_index(drop=True)
+    return df
+
+
+def _guess_position_columns(df):
+    """Best guess at which columns hold ticker / shares / entry price / date."""
+    if df is None or df.empty:
+        return None, None, None, None
+    cols = list(df.columns)
+
+    # A single-word company name ("Apple") also matches the ticker pattern, so weight
+    # tokens that are ALREADY uppercase in the source — real tickers almost always are.
+    sym_col, best = None, 0
+    for c in cols:
+        hits = 0
+        for v in df[c]:
+            t = str(v).strip()
+            if _looks_like_ticker(t):
+                hits += 2 if t.isupper() else 1
+        if hits > best:
+            best, sym_col = hits, c
+
+    def _by_name(keys):
+        for c in cols:
+            lc = str(c).lower()
+            if any(k in lc for k in keys):
+                return c
+        return None
+
+    shares_col = _by_name(["qty", "quantity", "shares", "units", "aantal", "stuks"])
+    price_col  = _by_name(["price", "cost", "avg", "average", "gak", "aankoop", "koers"])
+    date_col   = _by_name(["date", "bought", "purchase", "datum"])
+
+    numeric = [
+        c for c in cols
+        if c != sym_col
+        and sum(1 for v in df[c] if _parse_number(v) is not None) >= max(1, len(df) // 2)
+    ]
+    if shares_col is None and numeric:
+        shares_col = numeric[0]
+    if price_col is None:
+        rest = [c for c in numeric if c != shares_col]
+        if rest:
+            price_col = rest[0]
+    return sym_col, shares_col, price_col, date_col
+
+
 def load_positions() -> list:
     """Read saved positions from disk. Returns [] if absent or unreadable."""
     try:
@@ -3884,6 +4023,108 @@ with tab_pos:
                 st.success(f"Added {_p_shares:g} × {_p_sym} @ {_p_entry:.2f}"
                            + ("" if _ok else " (could not write positions.json — session only)"))
                 st.rerun()
+
+    # ── Paste straight from a broker page ─────────────────────────────────────
+    with st.expander("📋 Paste from your broker / shares site", expanded=False):
+        st.caption(
+            "Select your portfolio table on your broker's site, copy it, and paste below. "
+            "Tabs, semicolons, CSV, currency symbols and European decimals "
+            "(`1.234,56`) are all handled. Then just confirm which column is which."
+        )
+        _paste = st.text_area(
+            "Pasted portfolio data",
+            height=150, key="pos_paste",
+            placeholder=("AAPL\t10\t150.25\nMSFT\t5\t380.00\n\n"
+                         "…or with headers, commas, € signs — it will work it out."),
+        )
+        if _paste.strip():
+            _pdf = _parse_pasted_positions(_paste)
+            if _pdf is None or _pdf.empty:
+                st.warning("Could not find any rows in that text.")
+            else:
+                st.markdown("**What I read** (check the column mapping below)")
+                st.dataframe(_pdf.head(12), use_container_width=True, hide_index=True)
+                _gs, _gq, _gp, _gd = _guess_position_columns(_pdf)
+                _opts = list(_pdf.columns)
+                _none = "— none —"
+
+                def _idx(col, lst, dflt=0):
+                    return lst.index(col) if col in lst else dflt
+
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    _m_sym = st.selectbox("Ticker column", _opts,
+                                          index=_idx(_gs, _opts), key="map_sym")
+                with c2:
+                    _m_qty = st.selectbox("Shares column", _opts,
+                                          index=_idx(_gq, _opts), key="map_qty")
+                with c3:
+                    _m_prc = st.selectbox("Entry price column", _opts,
+                                          index=_idx(_gp, _opts), key="map_prc")
+                with c4:
+                    _dopts = [_none] + _opts
+                    _m_dat = st.selectbox("Date column (optional)", _dopts,
+                                          index=_idx(_gd, _dopts), key="map_dat")
+
+                _parsed, _skipped = [], []
+                for _, _row in _pdf.iterrows():
+                    _sy = str(_row[_m_sym]).strip().upper()
+                    _qt = _parse_number(_row[_m_qty])
+                    _pr = _parse_number(_row[_m_prc])
+                    _dt = ""
+                    if _m_dat != _none:
+                        _raw = str(_row[_m_dat]).strip()
+                        try:
+                            _dt = pd.to_datetime(_raw, dayfirst=True).date().isoformat()
+                        except Exception:
+                            _dt = ""
+                    if not _sy or not _looks_like_ticker(_sy) or not _qt or not _pr \
+                            or _qt <= 0 or _pr <= 0:
+                        if _sy or _qt or _pr:
+                            _skipped.append(f"{_sy or '?'} (shares={_qt}, price={_pr})")
+                        continue
+                    _parsed.append({"symbol": _sy, "shares": float(_qt),
+                                    "entry_price": float(_pr), "entry_date": _dt})
+
+                if _parsed:
+                    st.markdown(f"**Ready to import — {len(_parsed)} holding(s)**")
+                    st.dataframe(pd.DataFrame(_parsed), use_container_width=True,
+                                 hide_index=True)
+                else:
+                    st.warning(
+                        "No usable rows with that mapping. Check that the Ticker, Shares "
+                        "and Entry price columns point at the right things."
+                    )
+                if _skipped:
+                    st.caption("Skipped rows: " + ", ".join(_skipped[:8])
+                               + ("…" if len(_skipped) > 8 else ""))
+
+                if _parsed:
+                    i1, i2 = st.columns(2)
+                    with i1:
+                        if st.button(f"➕ Add these {len(_parsed)}", type="primary",
+                                     use_container_width=True, key="paste_append"):
+                            _merged = list(st.session_state.positions)
+                            _have = {p["symbol"] for p in _merged}
+                            _added = _upd = 0
+                            for _np in _parsed:
+                                if _np["symbol"] in _have:      # same ticker → update it
+                                    for _ex in _merged:
+                                        if _ex["symbol"] == _np["symbol"]:
+                                            _ex.update(_np); _upd += 1; break
+                                else:
+                                    _merged.append(_np); _added += 1
+                            st.session_state.positions = _merged
+                            save_positions(_merged)
+                            st.success(f"Added {_added}, updated {_upd}.")
+                            st.rerun()
+                    with i2:
+                        if st.button("♻️ Replace all holdings", use_container_width=True,
+                                     key="paste_replace"):
+                            st.session_state.positions = _parsed
+                            save_positions(_parsed)
+                            st.success(f"Replaced portfolio with {len(_parsed)} holding(s).")
+                            st.rerun()
 
     # ── Risk settings ─────────────────────────────────────────────────────────
     with st.expander("⚙️ My risk rules"):
