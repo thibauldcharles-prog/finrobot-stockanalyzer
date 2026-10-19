@@ -2464,6 +2464,15 @@ _POSITIONS_PATH = Path(__file__).parent / "positions.json"
 
 _CCY_CHARS = "$€£¥₹"
 
+# Words that mark a header row — English plus Dutch/Flemish (Bolero, KBC, DeGiro)
+_HDR_WORDS = {
+    "symbol", "ticker", "name", "product", "qty", "quantity", "shares", "units",
+    "price", "cost", "avg", "average", "value", "date", "bought", "purchase",
+    "amount", "position", "isin", "currency", "market", "type",
+    "aantal", "stuks", "koers", "aankoop", "gak", "waarde", "naam", "munt",
+    "markt", "rendement", "omschrijving", "datum",
+}
+
 
 def _parse_number(tok):
     """Pull a number out of broker text. Handles currency symbols, thousands
@@ -2501,9 +2510,34 @@ def _parse_number(tok):
     return -v if neg else v
 
 
+# Currency codes look exactly like tickers ("EUR", "USD"), and broker exports
+# almost always have a currency column — so exclude them or it gets picked as the
+# identifier and you end up with holdings called "EUR".
+_CCY_CODES = {
+    "EUR", "USD", "GBP", "GBX", "GBP", "CHF", "JPY", "CAD", "AUD", "NZD", "SEK",
+    "NOK", "DKK", "PLN", "CZK", "HUF", "HKD", "SGD", "ZAR", "INR", "BRL", "MXN",
+    "CNY", "KRW", "TRY", "ILS", "AED", "RUB",
+}
+# Common non-identifier words that would otherwise pass the ticker regex
+_NOT_TICKER = {
+    "NEE", "JA", "YES", "NO", "CASH", "TOTAL", "TOTAAL", "N/A", "NA", "NV", "SA",
+    "AG", "PLC", "LTD", "INC", "CORP", "ETF", "ETFS", "SHARES", "AANDELEN", "TYPE",
+    "NAAM", "NAME", "ISIN", "EUR", "USD", "BUY", "SELL", "LONG", "SHORT", "TRUE",
+    "FALSE", "AND", "THE", "VAN", "DE", "A", "B", "C",
+}
+
+
+def _looks_like_isin(tok) -> bool:
+    """ISIN = 2-letter country code + 9 alphanumerics + 1 check digit."""
+    t = str(tok).strip().upper().replace(" ", "")
+    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", t))
+
+
 def _looks_like_ticker(tok) -> bool:
     t = str(tok).strip().upper()
     if not (1 <= len(t) <= 12):
+        return False
+    if t in _CCY_CODES or t in _NOT_TICKER:
         return False
     return bool(re.fullmatch(r"[A-Z]{1,6}([.\-][A-Z0-9]{1,4})?", t))
 
@@ -2535,14 +2569,9 @@ def _parse_pasted_positions(text: str):
     rows = [r + [""] * (width - len(r)) for r in rows]
     df = pd.DataFrame(rows, columns=[f"col{i + 1}" for i in range(width)])
 
-    _hdr_words = {
-        "symbol", "ticker", "name", "product", "qty", "quantity", "shares", "units",
-        "price", "cost", "avg", "average", "value", "date", "bought", "purchase",
-        "amount", "position", "aantal", "stuks", "koers", "aankoop", "gak", "waarde",
-    }
     first = rows[0]
     looks_header = (
-        any(any(w in str(c).lower() for w in _hdr_words) for c in first)
+        any(any(w in str(c).lower() for w in _HDR_WORDS) for c in first)
         and not any(_parse_number(c) is not None for c in first)
     )
     if looks_header and len(rows) > 1:
@@ -2557,17 +2586,34 @@ def _guess_position_columns(df):
         return None, None, None, None
     cols = list(df.columns)
 
-    # A single-word company name ("Apple") also matches the ticker pattern, so weight
-    # tokens that are ALREADY uppercase in the source — real tickers almost always are.
+    # Identifier column, in order of reliability:
+    #   1. ISIN  — unambiguous, and most European brokers (Bolero, DeGiro…) include it
+    #   2. ticker — weight ALREADY-uppercase tokens, since a one-word company name
+    #      ("Apple") also matches the ticker pattern
+    #   3. a name column — resolved to a ticker later via lookup
     sym_col, best = None, 0
     for c in cols:
-        hits = 0
-        for v in df[c]:
-            t = str(v).strip()
-            if _looks_like_ticker(t):
-                hits += 2 if t.isupper() else 1
-        if hits > best:
-            best, sym_col = hits, c
+        if sum(1 for v in df[c] if _looks_like_isin(v)) >= max(1, len(df) // 2):
+            sym_col, best = c, 10_000          # ISIN wins outright
+            break
+    if sym_col is None:
+        for c in cols:
+            hits = 0
+            for v in df[c]:
+                t = str(v).strip()
+                if _looks_like_ticker(t):
+                    hits += 2 if t.isupper() else 1
+            if hits > best:
+                best, sym_col = hits, c
+    if sym_col is None:                        # no ticker anywhere → use a name column
+        for c in cols:
+            if any(k in str(c).lower() for k in ("naam", "name", "product", "omschrijving",
+                                                 "description", "instrument", "security")):
+                sym_col = c
+                break
+    if sym_col is None:                        # last resort: longest text column
+        _txt = [(sum(len(str(v)) for v in df[c]), c) for c in cols]
+        sym_col = max(_txt)[1] if _txt else cols[0]
 
     def _by_name(keys):
         for c in cols:
@@ -2592,6 +2638,261 @@ def _guess_position_columns(df):
         if rest:
             price_col = rest[0]
     return sym_col, shares_col, price_col, date_col
+
+
+def _guess_extra_columns(df):
+    """Find the currency column and a 'current price' column, if present. Both make
+    identifier resolution far more reliable."""
+    if df is None or df.empty:
+        return None, None
+    ccy_col = None
+    for c in df.columns:
+        if sum(1 for v in df[c] if str(v).strip().upper() in _CCY_CODES) >= max(1, len(df) // 2):
+            ccy_col = c
+            break
+    now_col = None
+    for c in df.columns:
+        lc = str(c).lower()
+        # "Koers" / "Price" / "Last" = the live price; exclude average-cost columns
+        if any(k in lc for k in ("koers", "slotkoers", "last", "current", "market price")) \
+                and not any(k in lc for k in ("gem", "avg", "average", "aankoop", "cost", "gak")):
+            now_col = c
+            break
+    return ccy_col, now_col
+
+
+# Broker market/exchange label → Yahoo ticker suffix. Brokers name the venue, and
+# that pins down WHICH listing of a cross-listed stock you actually hold — without
+# it, a search can hand back a thinly-traded mirror line in the wrong country.
+_MARKET_SUFFIX = [
+    ("euronext brussels", ".BR"), ("brussel", ".BR"), ("bruxelles", ".BR"),
+    ("euronext amsterdam", ".AS"), ("amsterdam", ".AS"),
+    ("euronext paris", ".PA"), ("paris", ".PA"),
+    ("euronext lisbon", ".LS"), ("lisbon", ".LS"),
+    ("xetra", ".DE"), ("frankfurt", ".F"), ("deutsche", ".DE"), ("germany", ".DE"),
+    ("milan", ".MI"), ("borsa italiana", ".MI"),
+    ("madrid", ".MC"), ("spain", ".MC"),
+    ("swiss", ".SW"), ("six", ".SW"), ("zurich", ".SW"),
+    ("vienna", ".VI"), ("wien", ".VI"),
+    ("stockholm", ".ST"), ("helsinki", ".HE"), ("copenhagen", ".CO"), ("oslo", ".OL"),
+    ("london", ".L"), ("lse", ".L"), ("united kingdom", ".L"),
+    ("toronto", ".TO"), ("canada", ".TO"),
+    ("australia", ".AX"), ("asx", ".AX"),
+    ("tokyo", ".T"), ("japan", ".T"),
+    ("hong kong", ".HK"), ("india", ".NS"), ("nse", ".NS"),
+    ("usa", ""), ("nasdaq", ""), ("nyse", ""), ("united states", ""), ("amex", ""),
+]
+
+
+def _market_suffix(market: str):
+    """Yahoo suffix for a broker market label. None when unrecognised."""
+    m = (market or "").strip().lower()
+    if not m:
+        return None
+    for key, sfx in _MARKET_SUFFIX:
+        if key in m:
+            return sfx
+    return None
+
+
+def _plausible_equity_symbol(sym: str) -> bool:
+    """Reject non-equity Yahoo symbols. Searches happily return futures (SPLTR=F),
+    indices (^GSPC) and crypto pairs (BTC-USD), and a futures contract can even
+    price near the stock — so they must never be candidate listings."""
+    s = (sym or "").upper()
+    if not s or any(ch in s for ch in "=^"):
+        return False
+    if re.search(r"-(USD|EUR|GBP|USDT)$", s):
+        return False
+    if re.fullmatch(r"[A-Z0-9]{1,8}(\.[A-Z]{1,3})?", s):
+        return True
+    # Some venues list a fund under its bare ISIN (IE0007Y8Y157.SG) — valid, if ugly
+    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9](\.[A-Z]{1,3})?", s))
+
+
+def _name_tokens(name: str, n: int = 4) -> str:
+    """Strip punctuation from a broker's instrument name and keep the first few
+    words — 'VANECK ETFS-QUANTUM COMP.ETF-A-K' searches far better as
+    'VANECK ETFS QUANTUM COMP'."""
+    s = re.sub(r"[^A-Za-z0-9 ]", " ", str(name or ""))
+    toks = [t for t in s.split() if len(t) > 1]
+    return " ".join(toks[:n])
+
+
+def _load_broker_table(uploaded):
+    """Read an uploaded broker export (Excel or CSV) into a clean table.
+
+    Real exports are messy: Bolero's .xlsx has four rows of account metadata above
+    the header, blank spacer columns between every real column, and legal footer
+    text below the data. So find the actual header row, drop empty columns and
+    strip blank rows rather than assuming row 0 is the header."""
+    fname = (getattr(uploaded, "name", "") or "").lower()
+    try:
+        if fname.endswith((".csv", ".txt", ".tsv")):
+            raw = pd.read_csv(uploaded, header=None, dtype=str,
+                              sep=None, engine="python")
+        else:
+            raw = pd.read_excel(uploaded, header=None, dtype=str)
+    except ImportError:
+        return None, ("Reading .xlsx needs the `openpyxl` package. Save your export "
+                      "as CSV instead, or run: pip install openpyxl")
+    except Exception as e:
+        return None, f"Could not read that file: {e}"
+    if raw is None or raw.empty:
+        return None, "That file appears to be empty."
+
+    # Drop columns that are entirely blank (broker spacer columns)
+    keep = [c for c in raw.columns
+            if raw[c].astype(str).str.strip().replace("nan", "").ne("").any()]
+    raw = raw[keep] if keep else raw
+
+    # Locate the header row: the one with the most recognised header words
+    hdr_i, hdr_hits = None, 0
+    for i in range(min(30, len(raw))):
+        vals = [str(v).strip().lower() for v in raw.iloc[i]
+                if str(v).strip() and str(v).strip().lower() != "nan"]
+        hits = sum(1 for v in vals if any(w in v for w in _HDR_WORDS))
+        if hits > hdr_hits and hits >= 3:
+            hdr_i, hdr_hits = i, hits
+
+    if hdr_i is None:
+        df = raw.copy()
+        df.columns = [f"col{i + 1}" for i in range(len(df.columns))]
+    else:
+        seen, cols = {}, []
+        for j, v in enumerate(raw.iloc[hdr_i]):
+            h = str(v).strip()
+            if not h or h.lower() == "nan":
+                h = f"col{j + 1}"
+            if h in seen:
+                seen[h] += 1
+                h = f"{h}_{seen[h]}"
+            else:
+                seen[h] = 0
+            cols.append(h)
+        df = raw.iloc[hdr_i + 1:].copy()
+        df.columns = cols
+
+    df = df.reset_index(drop=True).fillna("")
+    # Drop blank rows and obvious footer/disclaimer rows (one long text cell, no numbers)
+    def _is_junk(row):
+        cells = [str(v).strip() for v in row]
+        filled = [c for c in cells if c and c.lower() != "nan"]
+        if not filled:
+            return True
+        if len(filled) <= 2 and max((len(c) for c in filled), default=0) > 80:
+            return True
+        return False
+    df = df[~df.apply(_is_junk, axis=1)].reset_index(drop=True)
+    if df.empty:
+        return None, "Found a table but no data rows under the header."
+    # Now that only data rows remain, drop spacer columns again — the account
+    # metadata above the header can leave stray values in otherwise-blank columns.
+    keep2 = [c for c in df.columns
+             if df[c].astype(str).str.strip().replace("nan", "").ne("").any()]
+    if keep2:
+        df = df[keep2]
+    return df, None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _resolve_identifier(raw: str, want_ccy: str = "", want_price: float = None,
+                        alt: str = "", want_sfx: str = None) -> dict:
+    """Resolve a ticker, ISIN or company name to a Yahoo Finance symbol.
+
+    Many brokers (Bolero, DeGiro, …) export only a NAME and an ISIN — no ticker.
+    Worse, the same fund lists in several currencies, and picking the wrong listing
+    silently corrupts P&L (e.g. the VanEck Quantum ETF trades as QNTM.L in USD and
+    QUTM.DE in EUR). So when the broker's own currency and current price are
+    available they are used to score candidates — a near-exact price match is the
+    strongest possible confirmation that a listing is the right one."""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+
+    cands = []
+    if _looks_like_ticker(raw.upper()):
+        cands.append(raw.upper())
+    # Search the ISIN/ticker AND, when given, the company name. The same fund can
+    # list on several exchanges and an ISIN search often surfaces only one of them,
+    # so pooling both sets lets the price check below pick the closest listing.
+    for query in (raw, alt, _name_tokens(alt)):
+        if not query:
+            continue
+        try:
+            res = yf.Search(query, max_results=10)
+            for q in (res.quotes or []):
+                s = q.get("symbol")
+                if s and s not in cands and _plausible_equity_symbol(s):
+                    cands.append(s)
+        except Exception:
+            pass
+    if _looks_like_isin(raw) and raw.upper() not in cands:
+        cands.append(raw.upper())
+    # Build the venue-specific symbol directly: a search for "BPOST NV" may never
+    # surface BPOST.BR, but the market column says Euronext Brussels, so try the
+    # name's first word plus that suffix. Kept to one guess — broader guessing just
+    # generates dead symbols and slow 404s.
+    if want_sfx:
+        first = _name_tokens(alt, 1).upper()
+        if first and _plausible_equity_symbol(first + want_sfx) \
+                and (first + want_sfx) not in cands:
+            cands.append(first + want_sfx)
+    cands = [c for c in cands if _plausible_equity_symbol(c) or _looks_like_isin(c)]
+
+    best, best_score = None, -(10 ** 9)
+    for sym in cands[:16]:
+        try:
+            info = _get_info_cached(sym) or {}
+        except Exception:
+            continue
+        price = (info.get("currentPrice") or info.get("regularMarketPrice")
+                 or info.get("navPrice") or info.get("previousClose"))
+        if not price:
+            continue
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            continue
+        ccy = (info.get("currency") or "").upper()
+        score = 5
+        # Prefer the primary listing. Symbols beginning with a digit are LSE
+        # international depositary lines (0QF5.IL, 0HYI.L) — same company, thinly
+        # traded mirror — and bare ISIN-style symbols are secondary venue lines.
+        # Both can price identically to the real listing, so the price check alone
+        # cannot separate them.
+        if sym[:1].isdigit():
+            score -= 35
+        if _looks_like_isin(sym.split(".")[0]):
+            score -= 20
+        if want_sfx is not None:
+            _sfx = ("." + sym.split(".", 1)[1]) if "." in sym else ""
+            score += 70 if _sfx.upper() == want_sfx.upper() else -15
+        if want_ccy and ccy:
+            score += 40 if ccy == want_ccy.upper() else -25
+        if want_price:
+            try:
+                rel = abs(price - float(want_price)) / float(want_price)
+                # Deliberately flat at the top: a broker's quote may be a close or a
+                # delayed price, so anything within 2% is "the same instrument" and
+                # should NOT out-score a better listing by a few points.
+                score += (100 if rel < 0.02 else 70 if rel < 0.05
+                          else 30 if rel < 0.12 else -30)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        if score > best_score:
+            best_score, best = score, {
+                "ticker": sym, "price": price, "currency": ccy,
+                "name": info.get("shortName") or info.get("longName") or sym,
+                "score": score,
+            }
+    if not best or best_score <= 0:
+        return {}
+    # Confidence for the UI: did the price actually corroborate the match?
+    best["confident"] = bool(
+        want_price and abs(best["price"] - float(want_price)) / float(want_price) < 0.03
+    ) or (bool(want_ccy) and best["currency"] == want_ccy.upper() and best_score >= 45)
+    return best
 
 
 def load_positions() -> list:
@@ -4029,107 +4330,217 @@ with tab_pos:
                            + ("" if _ok else " (could not write positions.json — session only)"))
                 st.rerun()
 
-    # ── Paste straight from a broker page ─────────────────────────────────────
-    with st.expander("📋 Paste from your broker / shares site", expanded=False):
+    # ── Import from a broker file or pasted text ──────────────────────────────
+    with st.expander("📥 Import from your broker (file or paste)", expanded=False):
         st.caption(
-            "Select your portfolio table on your broker's site, copy it, and paste below. "
-            "Tabs, semicolons, CSV, currency symbols and European decimals "
-            "(`1.234,56`) are all handled. Then just confirm which column is which."
+            "**Upload the export file** — that's the most reliable route, and it works "
+            "with Bolero/KBC, DeGiro and most brokers even when they only give company "
+            "names and ISINs instead of ticker symbols. Pasting text also works."
         )
-        _paste = st.text_area(
-            "Pasted portfolio data",
-            height=150, key="pos_paste",
-            placeholder=("AAPL\t10\t150.25\nMSFT\t5\t380.00\n\n"
-                         "…or with headers, commas, € signs — it will work it out."),
-        )
-        if _paste.strip():
-            _pdf = _parse_pasted_positions(_paste)
-            if _pdf is None or _pdf.empty:
-                st.warning("Could not find any rows in that text.")
-            else:
-                st.markdown("**What I read** (check the column mapping below)")
-                st.dataframe(_pdf.head(12), use_container_width=True, hide_index=True)
-                _gs, _gq, _gp, _gd = _guess_position_columns(_pdf)
-                _opts = list(_pdf.columns)
-                _none = "— none —"
+        _src = st.radio("Source", ["📁 Upload file (Excel / CSV)", "📋 Paste text"],
+                        horizontal=True, key="imp_src", label_visibility="collapsed")
 
-                def _idx(col, lst, dflt=0):
-                    return lst.index(col) if col in lst else dflt
+        _idf = None
+        if _src.startswith("📁"):
+            _bfile = st.file_uploader("Broker export", type=["xlsx", "xls", "csv", "txt", "tsv"],
+                                      key="imp_file")
+            if _bfile is not None:
+                _idf, _err = _load_broker_table(_bfile)
+                if _err:
+                    st.error(_err)
+        else:
+            _paste = st.text_area(
+                "Pasted portfolio data", height=140, key="pos_paste",
+                placeholder=("AAPL\t10\t150.25\nMSFT\t5\t380.00\n\n"
+                             "Tabs, semicolons, CSV, € signs and 1.234,56 all work."),
+            )
+            if _paste.strip():
+                _idf = _parse_pasted_positions(_paste)
+                if _idf is None or _idf.empty:
+                    st.warning("Could not find any rows in that text.")
+                    _idf = None
 
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    _m_sym = st.selectbox("Ticker column", _opts,
-                                          index=_idx(_gs, _opts), key="map_sym")
-                with c2:
-                    _m_qty = st.selectbox("Shares column", _opts,
-                                          index=_idx(_gq, _opts), key="map_qty")
-                with c3:
-                    _m_prc = st.selectbox("Entry price column", _opts,
-                                          index=_idx(_gp, _opts), key="map_prc")
-                with c4:
-                    _dopts = [_none] + _opts
-                    _m_dat = st.selectbox("Date column (optional)", _dopts,
-                                          index=_idx(_gd, _dopts), key="map_dat")
+        if _idf is not None and not _idf.empty:
+            st.markdown(f"**What I read — {len(_idf)} row(s).** Check the mapping below.")
+            st.dataframe(_idf.head(15), use_container_width=True, hide_index=True)
 
-                _parsed, _skipped = [], []
-                for _, _row in _pdf.iterrows():
-                    _sy = str(_row[_m_sym]).strip().upper()
+            _gs, _gq, _gp, _gd = _guess_position_columns(_idf)
+            _gc, _gn = _guess_extra_columns(_idf)
+            _opts = list(_idf.columns)
+            _NONE = "— none —"
+
+            def _idx(col, lst, dflt=0):
+                return lst.index(col) if col in lst else dflt
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                _m_sym = st.selectbox(
+                    "Identifier column", _opts, index=_idx(_gs, _opts), key="map_sym",
+                    help="Ticker, ISIN or company name — ISIN is the most reliable",
+                )
+            with c2:
+                _m_qty = st.selectbox("Shares / quantity", _opts,
+                                      index=_idx(_gq, _opts), key="map_qty")
+            with c3:
+                _m_prc = st.selectbox("Entry price (avg buy)", _opts,
+                                      index=_idx(_gp, _opts), key="map_prc")
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                _dop = [_NONE] + _opts
+                _m_dat = st.selectbox("Purchase date (optional)", _dop,
+                                      index=_idx(_gd, _dop), key="map_dat")
+            with c5:
+                _m_ccy = st.selectbox("Currency (optional)", _dop,
+                                      index=_idx(_gc, _dop), key="map_ccy",
+                                      help="Used to pick the right listing of a stock")
+            with c6:
+                _m_now = st.selectbox("Current price (optional)", _dop,
+                                      index=_idx(_gn, _dop), key="map_now",
+                                      help="Strongest signal for picking the right "
+                                           "listing — matched against Yahoo's price")
+            _gm = next((c for c in _opts
+                        if any(k in str(c).lower()
+                               for k in ("markt", "market", "exchange", "beurs", "venue"))),
+                       None)
+            _m_mkt = st.selectbox(
+                "Market / exchange (optional)", _dop, index=_idx(_gm, _dop), key="map_mkt",
+                help="Pins down WHICH listing you hold — e.g. Euronext Brussels vs a "
+                     "London mirror line of the same company",
+            )
+
+            _needs_lookup = not all(
+                _looks_like_ticker(str(v)) for v in _idf[_m_sym].head(8) if str(v).strip()
+            )
+            if _needs_lookup:
+                st.info(
+                    "That identifier column holds **ISINs or names**, not ticker symbols, "
+                    "so each one needs looking up on Yahoo Finance. Press the button below "
+                    "— it takes a few seconds per holding."
+                )
+            _do = st.button("🔎 Match holdings & preview" if _needs_lookup
+                            else "✅ Build preview",
+                            type="primary", key="imp_match")
+
+            if _do:
+                _rows, _fail = [], []
+                _bar = st.progress(0.0)
+                _tot = max(1, len(_idf))
+                for _i, (_, _row) in enumerate(_idf.iterrows()):
+                    _bar.progress((_i + 1) / _tot)
+                    _ident = str(_row[_m_sym]).strip()
                     _qt = _parse_number(_row[_m_qty])
                     _pr = _parse_number(_row[_m_prc])
+                    if not _ident or not _qt or not _pr or _qt <= 0 or _pr <= 0:
+                        continue                      # cash / total / blank rows
+                    _ccy = ""
+                    if _m_ccy != _NONE:
+                        _c = str(_row[_m_ccy]).strip().upper()
+                        _ccy = _c if _c in _CCY_CODES else ""
+                    _now = _parse_number(_row[_m_now]) if _m_now != _NONE else None
                     _dt = ""
-                    if _m_dat != _none:
-                        _raw = str(_row[_m_dat]).strip()
+                    if _m_dat != _NONE:
                         try:
-                            _dt = pd.to_datetime(_raw, dayfirst=True).date().isoformat()
+                            _dt = pd.to_datetime(str(_row[_m_dat]).strip(),
+                                                 dayfirst=True).date().isoformat()
                         except Exception:
                             _dt = ""
-                    if not _sy or not _looks_like_ticker(_sy) or not _qt or not _pr \
-                            or _qt <= 0 or _pr <= 0:
-                        if _sy or _qt or _pr:
-                            _skipped.append(f"{_sy or '?'} (shares={_qt}, price={_pr})")
+
+                    if _looks_like_ticker(_ident.upper()) and not _looks_like_isin(_ident):
+                        _rows.append({"symbol": _ident.upper(), "shares": float(_qt),
+                                      "entry_price": float(_pr), "entry_date": _dt,
+                                      "matched": _ident.upper(), "yahoo_price": None,
+                                      "confident": True, "source": "ticker"})
                         continue
-                    _parsed.append({"symbol": _sy, "shares": float(_qt),
-                                    "entry_price": float(_pr), "entry_date": _dt})
+                    # ISIN first (most reliable); the name is pooled in as a second
+                    # search so the price check can pick the right listing, and is
+                    # also the fallback if the ISIN resolves to nothing.
+                    _nm_col = next((c for c in _idf.columns
+                                    if any(k in str(c).lower()
+                                           for k in ("naam", "name", "product",
+                                                     "omschrijving", "description"))
+                                    and c != _m_sym), None)
+                    _nm = str(_row[_nm_col]).strip() if _nm_col else ""
+                    _sfx = (_market_suffix(str(_row[_m_mkt]))
+                            if _m_mkt != _NONE else None)
+                    _res = _resolve_identifier(_ident, _ccy, _now, _nm, _sfx)
+                    _via = "ISIN" if _looks_like_isin(_ident) else "name"
+                    if not _res and _nm:
+                        _res = _resolve_identifier(_nm, _ccy, _now, "", _sfx)
+                        _via = "name"
+                    if _res:
+                        _rows.append({
+                            "symbol": _res["ticker"], "shares": float(_qt),
+                            "entry_price": float(_pr), "entry_date": _dt,
+                            "matched": f"{_res['ticker']} — {_res['name'][:26]}",
+                            "yahoo_price": _res["price"], "confident": _res.get("confident"),
+                            "source": _via,
+                        })
+                    else:
+                        _fail.append(_ident[:40])
+                _bar.empty()
+                st.session_state["imp_rows"] = _rows
+                st.session_state["imp_fail"] = _fail
 
-                if _parsed:
-                    st.markdown(f"**Ready to import — {len(_parsed)} holding(s)**")
-                    st.dataframe(pd.DataFrame(_parsed), use_container_width=True,
-                                 hide_index=True)
-                else:
+            _rows = st.session_state.get("imp_rows") or []
+            _fail = st.session_state.get("imp_fail") or []
+            if _rows:
+                _pv = pd.DataFrame([{
+                    "Ticker": r["symbol"], "Matched as": r["matched"],
+                    "Via": r["source"], "Shares": r["shares"],
+                    "Your entry": r["entry_price"], "Yahoo price": r["yahoo_price"],
+                    "Confident": "✅" if r["confident"] else "⚠️ check",
+                } for r in _rows])
+                st.markdown(f"**Ready to import — {len(_rows)} holding(s)**")
+                st.dataframe(_pv, use_container_width=True, hide_index=True,
+                             column_config={
+                                 "Your entry":  st.column_config.NumberColumn(format="%.4f"),
+                                 "Yahoo price": st.column_config.NumberColumn(format="%.2f"),
+                             })
+                if any(not r["confident"] for r in _rows):
                     st.warning(
-                        "No usable rows with that mapping. Check that the Ticker, Shares "
-                        "and Entry price columns point at the right things."
+                        "⚠️ Rows marked **check** could not be confirmed against your "
+                        "broker's price, so they may point at the wrong listing (a stock "
+                        "can trade in several currencies). Map the **Currency** and "
+                        "**Current price** columns above to let me verify them, or fix "
+                        "the ticker by hand after importing."
                     )
-                if _skipped:
-                    st.caption("Skipped rows: " + ", ".join(_skipped[:8])
-                               + ("…" if len(_skipped) > 8 else ""))
-
-                if _parsed:
-                    i1, i2 = st.columns(2)
-                    with i1:
-                        if st.button(f"➕ Add these {len(_parsed)}", type="primary",
-                                     use_container_width=True, key="paste_append"):
-                            _merged = list(st.session_state.positions)
-                            _have = {p["symbol"] for p in _merged}
-                            _added = _upd = 0
-                            for _np in _parsed:
-                                if _np["symbol"] in _have:      # same ticker → update it
-                                    for _ex in _merged:
-                                        if _ex["symbol"] == _np["symbol"]:
-                                            _ex.update(_np); _upd += 1; break
-                                else:
-                                    _merged.append(_np); _added += 1
-                            st.session_state.positions = _merged
-                            save_positions(_merged)
-                            st.success(f"Added {_added}, updated {_upd}.")
-                            st.rerun()
-                    with i2:
-                        if st.button("♻️ Replace all holdings", use_container_width=True,
-                                     key="paste_replace"):
-                            st.session_state.positions = _parsed
-                            save_positions(_parsed)
-                            st.success(f"Replaced portfolio with {len(_parsed)} holding(s).")
-                            st.rerun()
+                i1, i2 = st.columns(2)
+                _clean = [{k: r[k] for k in ("symbol", "shares", "entry_price", "entry_date")}
+                          for r in _rows]
+                with i1:
+                    if st.button(f"➕ Add these {len(_clean)}", type="primary",
+                                 use_container_width=True, key="imp_append"):
+                        _merged = list(st.session_state.positions)
+                        _have = {p["symbol"] for p in _merged}
+                        _a = _u = 0
+                        for _np in _clean:
+                            if _np["symbol"] in _have:
+                                for _ex in _merged:
+                                    if _ex["symbol"] == _np["symbol"]:
+                                        _ex.update(_np); _u += 1; break
+                            else:
+                                _merged.append(_np); _a += 1
+                        st.session_state.positions = _merged
+                        save_positions(_merged)
+                        st.session_state["imp_rows"] = None
+                        st.success(f"Added {_a}, updated {_u}.")
+                        st.rerun()
+                with i2:
+                    if st.button("♻️ Replace all holdings", use_container_width=True,
+                                 key="imp_replace"):
+                        st.session_state.positions = _clean
+                        save_positions(_clean)
+                        st.session_state["imp_rows"] = None
+                        st.success(f"Replaced portfolio with {len(_clean)} holding(s).")
+                        st.rerun()
+            if _fail:
+                st.error(
+                    "Could not match: **" + "**, **".join(_fail[:8]) + "**"
+                    + ("…" if len(_fail) > 8 else "")
+                    + ". Add these by hand with the form above — some instruments "
+                      "(certain funds, certificates, private placements) simply aren't "
+                      "on Yahoo Finance."
+                )
 
     # ── Risk settings ─────────────────────────────────────────────────────────
     with st.expander("⚙️ My risk rules"):
