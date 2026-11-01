@@ -3153,7 +3153,7 @@ with st.sidebar:
         value=st.session_state.symbol,
     ).strip().upper()
 
-    analyze_clicked = st.button("🔍  Analyze", use_container_width=True, type="primary")
+    analyze_clicked = st.button("🔍  Analyze", width="stretch", type="primary")
 
     if analyze_clicked and ticker_input:
         st.session_state.symbol   = ticker_input
@@ -3305,7 +3305,7 @@ with tab_ov:
                 "# of Analysts":      str(info.get("numberOfAnalystOpinions","N/A")),
             }
             df_m = pd.DataFrame({"Metric":list(metrics.keys()),"Value":list(metrics.values())}).set_index("Metric")
-            st.dataframe(df_m, use_container_width=True, height=540)
+            st.dataframe(df_m, width="stretch", height=540)
 
         with right_col:
             st.markdown('<div class="section-header">Business Description</div>', unsafe_allow_html=True)
@@ -3335,7 +3335,7 @@ with tab_chart:
         if hist.empty:
             st.warning("No price history available for this ticker.")
         else:
-            st.plotly_chart(build_chart(hist, sym), use_container_width=True, config={
+            st.plotly_chart(build_chart(hist, sym), width="stretch", config={
                 "displayModeBar": True,
                 "modeBarButtonsToRemove": ["lasso2d","select2d"],
                 "scrollZoom": True,
@@ -3357,9 +3357,9 @@ with tab_fin:
     if info:
         st.caption("Annual figures — most recent year shown first. Values in USD.")
         ft1, ft2, ft3 = st.tabs(["Income Statement","Balance Sheet","Cash Flow"])
-        with ft1: st.dataframe(format_financial_df(income),   use_container_width=True, height=700)
-        with ft2: st.dataframe(format_financial_df(balance),  use_container_width=True, height=700)
-        with ft3: st.dataframe(format_financial_df(cashflow), use_container_width=True, height=700)
+        with ft1: st.dataframe(format_financial_df(income),   width="stretch", height=700)
+        with ft2: st.dataframe(format_financial_df(balance),  width="stretch", height=700)
+        with ft3: st.dataframe(format_financial_df(cashflow), width="stretch", height=700)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3387,7 +3387,7 @@ with tab_ai:
         btn_cols = st.columns(3)
         for i, (key, (label, tooltip)) in enumerate(ANALYSIS_TYPES.items()):
             with btn_cols[i % 3]:
-                if st.button(label, key=f"btn_{key}", use_container_width=True, help=tooltip):
+                if st.button(label, key=f"btn_{key}", width="stretch", help=tooltip):
                     with st.spinner(f"Analyzing {label}…"):
                         try:
                             result = run_local_analysis(key, sym, info, income, balance, cashflow)
@@ -3500,7 +3500,7 @@ with tab_picks:
         value=True, key="sp_div",
         help="Caps how many picks come from any single sector so the list isn't dominated by one industry.",
     )
-    run_screen = st.button("🔎  Scan Global Stocks", type="primary", use_container_width=True)
+    run_screen = st.button("🔎  Scan Global Stocks", type="primary", width="stretch")
 
     if run_screen:
         _pb  = st.progress(0)
@@ -3630,7 +3630,7 @@ with tab_vr:
         st.markdown("")
         st.markdown("")
         vr_run = st.button("🎯  Run Value Radar", type="primary",
-                           use_container_width=True, key="vr_run")
+                           width="stretch", key="vr_run")
 
     vr_diversify = st.checkbox(
         "🌐 Diversify across sectors (spread picks over different markets, not just the top-scoring niche)",
@@ -3783,7 +3783,7 @@ with tab_daily:
         )
     with btn_col:
         _gen = st.button("✨ Generate", key="daily_gen",
-                         help="Run today's global scan (~60s)", use_container_width=True)
+                         help="Run today's global scan (~60s)", width="stretch")
     st.markdown("")
 
     # Lazy scan — only runs on button click, never automatically at startup.
@@ -3886,7 +3886,7 @@ with tab_daily:
             with btn_c:
                 st.markdown("<div style='padding-top:8px;'></div>", unsafe_allow_html=True)
                 if st.button("📊 Deep-Dive", key=f"daily_dd_{p['symbol']}_{rank}",
-                             use_container_width=True):
+                             width="stretch"):
                     st.session_state.symbol   = p["symbol"]
                     st.session_state.loaded   = False
                     st.session_state.analyses = {}
@@ -3941,7 +3941,7 @@ with tab_daily:
                 unsafe_allow_html=True,
             )
             if st.button("📊 Analyze", key=f"daily_etf_{e['symbol']}_{rank}",
-                         use_container_width=False):
+                         width="content"):
                 st.session_state.symbol   = e["symbol"]
                 st.session_state.loaded   = False
                 st.session_state.analyses = {}
@@ -3969,7 +3969,7 @@ with tab_pulse:
 
     _pc1, _pc2 = st.columns([1, 4])
     with _pc1:
-        if st.button("🔄 Refresh now", key="pulse_refresh", use_container_width=True):
+        if st.button("🔄 Refresh now", key="pulse_refresh", width="stretch"):
             get_market_context.clear()
             st.rerun()
 
@@ -3986,7 +3986,7 @@ with tab_pulse:
             "try **🔄 Refresh now** in a few minutes."
         )
     else:
-        _sig = _ctx["signals"]
+        _mp_sig = _ctx["signals"]
         _vix = _ctx.get("vix")
         _reg = _ctx.get("regime", "Neutral")
         _reg_color = {"Risk-on": "#3fb950", "Risk-off": "#f85149"}.get(_reg, "#d29922")
@@ -3997,7 +3997,7 @@ with tab_pulse:
                   help="Below 20 = calm, above 28 = stressed")
         m3.metric("Geo tension", _ctx.get("tension_label", "—"),
                   help="Defense + gold + oil bid, and volatility")
-        m4.metric("Signals live", f"{len(_sig)}/{len(_MARKET_PROBES)}")
+        m4.metric("Signals live", f"{len(_mp_sig)}/{len(_MARKET_PROBES)}")
         st.caption(f"As of {_ctx.get('asof','')} · regime drives defensive vs cyclical tilt in every pick's score.")
         st.markdown("")
 
@@ -4011,7 +4011,7 @@ with tab_pulse:
         def _pulse_table(title, syms, note=""):
             rows = []
             for s_ in syms:
-                d = _sig.get(s_)
+                d = _mp_sig.get(s_)
                 if not d or d.get("rs") is None:
                     continue
                 rows.append({
@@ -4030,7 +4030,7 @@ with tab_pulse:
             if note:
                 st.caption(note)
             st.dataframe(
-                df_, use_container_width=True, hide_index=True,
+                df_, width="stretch", hide_index=True,
                 column_config={
                     "Strength": st.column_config.TextColumn("Strength", help="🟩 leading · 🟥 lagging"),
                     "vs S&P":  st.column_config.NumberColumn("vs S&P", format="%+.1f%%",
@@ -4065,7 +4065,7 @@ with tab_pulse:
             "about political risk with what investors are doing with real money.",
         )
 
-        _ranked = sorted((d for d in _sig.values() if d.get("rs") is not None),
+        _ranked = sorted((d for d in _mp_sig.values() if d.get("rs") is not None),
                          key=lambda d: -d["rs"])
         lc, rc = st.columns(2)
         with lc:
@@ -4108,7 +4108,7 @@ with tab_div:
 
     _dc1, _dc2 = st.columns([1, 4])
     with _dc1:
-        if st.button("🔄 Refresh", key="div_refresh", use_container_width=True):
+        if st.button("🔄 Refresh", key="div_refresh", width="stretch"):
             get_diversification_map.clear()
             st.rerun()
 
@@ -4180,7 +4180,7 @@ with tab_div:
             _df = pd.DataFrame(_rows).sort_values("Score", ascending=False)
             st.markdown(f"<div class='section-header'>{_bucket}</div>", unsafe_allow_html=True)
             st.dataframe(
-                _df, use_container_width=True, hide_index=True,
+                _df, width="stretch", hide_index=True,
                 column_config={
                     "Score":       st.column_config.ProgressColumn(
                         "Score", min_value=0, max_value=100, format="%d",
@@ -4240,7 +4240,7 @@ with tab_div:
             if _alloc:
                 _adf = pd.DataFrame(_alloc).sort_values("Weight", ascending=False)
                 st.dataframe(
-                    _adf, use_container_width=True, hide_index=True,
+                    _adf, width="stretch", hide_index=True,
                     column_config={
                         "Weight":      st.column_config.NumberColumn("Weight", format="%.1f%%"),
                         "Score":       st.column_config.ProgressColumn(
@@ -4312,7 +4312,7 @@ with tab_pos:
         with f5:
             st.markdown("")
             st.markdown("")
-            _p_add = st.button("Add", type="primary", use_container_width=True, key="pos_add")
+            _p_add = st.button("Add", type="primary", width="stretch", key="pos_add")
         if _p_add:
             if not _p_sym:
                 st.warning("Enter a ticker symbol.")
@@ -4362,7 +4362,7 @@ with tab_pos:
 
         if _idf is not None and not _idf.empty:
             st.markdown(f"**What I read — {len(_idf)} row(s).** Check the mapping below.")
-            st.dataframe(_idf.head(15), use_container_width=True, hide_index=True)
+            st.dataframe(_idf.head(15), width="stretch", hide_index=True)
 
             _gs, _gq, _gp, _gd = _guess_position_columns(_idf)
             _gc, _gn = _guess_extra_columns(_idf)
@@ -4491,7 +4491,7 @@ with tab_pos:
                     "Confident": "✅" if r["confident"] else "⚠️ check",
                 } for r in _rows])
                 st.markdown(f"**Ready to import — {len(_rows)} holding(s)**")
-                st.dataframe(_pv, use_container_width=True, hide_index=True,
+                st.dataframe(_pv, width="stretch", hide_index=True,
                              column_config={
                                  "Your entry":  st.column_config.NumberColumn(format="%.4f"),
                                  "Yahoo price": st.column_config.NumberColumn(format="%.2f"),
@@ -4509,7 +4509,7 @@ with tab_pos:
                           for r in _rows]
                 with i1:
                     if st.button(f"➕ Add these {len(_clean)}", type="primary",
-                                 use_container_width=True, key="imp_append"):
+                                 width="stretch", key="imp_append"):
                         _merged = list(st.session_state.positions)
                         _have = {p["symbol"] for p in _merged}
                         _a = _u = 0
@@ -4526,7 +4526,7 @@ with tab_pos:
                         st.success(f"Added {_a}, updated {_u}.")
                         st.rerun()
                 with i2:
-                    if st.button("♻️ Replace all holdings", use_container_width=True,
+                    if st.button("♻️ Replace all holdings", width="stretch",
                                  key="imp_replace"):
                         st.session_state.positions = _clean
                         save_positions(_clean)
@@ -4642,7 +4642,7 @@ with tab_pos:
                 "Conviction": s["conviction"],
             })
         st.dataframe(
-            pd.DataFrame(_rows), use_container_width=True, hide_index=True,
+            pd.DataFrame(_rows), width="stretch", hide_index=True,
             column_config={
                 "Entry":  st.column_config.NumberColumn("Entry",  format="%.2f"),
                 "Price":  st.column_config.NumberColumn("Price",  format="%.2f"),
@@ -4773,7 +4773,7 @@ with tab_pos:
         e1, e2 = st.columns(2)
         with e1:
             st.download_button("⬇ Download CSV", data=_csv, file_name="my_positions.csv",
-                               mime="text/csv", use_container_width=True)
+                               mime="text/csv", width="stretch")
         with e2:
             _up = st.file_uploader("⬆ Restore from CSV", type=["csv"], key="pos_upload")
             if _up is not None:
